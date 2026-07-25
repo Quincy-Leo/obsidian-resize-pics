@@ -1,0 +1,9 @@
+{
+  "id": "resize-pics",
+  "name": "resize-pics",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Rescale images to matches the text font size.",
+  "author": "QuincyLeo",
+  "isDesktopOnly": true
+}
