@@ -119,17 +119,27 @@ Versions and hashes are consolidated in the `REQUIRED_ASSETS` array at the top o
  │  src/resize.js · ResizeImagesJob.run()                        │
  │  · Read body font size bodyFontPx (getComputedStyle)         │
  │  · vault.read() the current note content                     │
- │  · metadataCache.getFileCache().embeds — parser-confirmed    │
- │    image positions                                           │
+ │  · metadataCache.getFileCache() → embeds + sections          │
  └────────────────────────────┬─────────────────────────────────┘
                               │
                               ▼
  ┌──────────────────────────────────────────────────────────────┐
- │  ResizeImagesJob.rewriteContent()                             │
- │  · Iterate embeds in reverse offset order                    │
- │  · loadImageDimensions() → naturalWidth                      │
+ │  src/getPics.js · PicSource                                   │
+ │  · collectReferences(embeds, sections):                      │
+ │      local (embeds) + external (regex on safe sections)      │
+ │      merged, sorted DESC by offset, non-overlapping          │
+ │  · resolve(edit) → {kind, tfile|bytes, dims, ...}            │
+ │      - local:  getResourcePath + loadImageDimensions         │
+ │      - external: requestUrl retry 3× + blob-URL dims         │
+ └────────────────────────────┬─────────────────────────────────┘
+                              │
+                              ▼
+ ┌──────────────────────────────────────────────────────────────┐
+ │  ResizeImagesJob.rewriteContent() — resize concerns only     │
+ │  · For each edit, dispatch on picSource.resolve().kind       │
  │  · imageTextHeightDetector.ensureWorker() lazily on first use│
- │  · detect() runs tesseract → line heights → 20% trimmed mean │
+ │  · detect({bytes | resourcePath}) → line heights → trimmed   │
+ │    mean → imageTextHeightPx                                  │
  │  · newWidth = round(naturalWidth × bodyFontPx / textHeightPx)│
  │  · Rewrite the size segment for both wikilink & standard MD  │
  └────────────────────────────┬─────────────────────────────────┘
@@ -169,11 +179,20 @@ resize-pics/
 │   │                          #   · bilingualError           (used before language is known)
 │   │                          #   · localizedError           (used after language is loaded)
 │   │
+│   ├── getPics.js             # Image discovery + fetching (no OCR / no rewrite)
+│   │                          #   · IMAGE_EXT_RE / OCR_SUPPORTED_EXT_RE
+│   │                          #   · EXTERNAL_URL_RE / EXTERNAL_HTTPS_RE
+│   │                          #   · SAFE_SECTION_TYPES = {paragraph, list, blockquote, callout}
+│   │                          #   · EXTERNAL_FETCH_MAX_ATTEMPTS=3, BACKOFF_MS=200
+│   │                          #   · collectImageReferences         (embeds → edit list)
+│   │                          #   · collectExternalImageReferences (sections → edit list)
+│   │                          #   · fetchExternalImageBytes        (requestUrl + linear backoff)
+│   │                          #   · loadImageDimensions[FromBytes] (URL or blob-URL path)
+│   │                          #   · PicSource                       (collectReferences + resolve)
+│   │
 │   ├── resize.js              # Resize pipeline + Markdown-syntax rewriting
 │   │                          #   · CONTENT_ROOT_SELECTORS   (reading/edit-view font source)
-│   │                          #   · IMAGE_EXT_RE / OCR_SUPPORTED_EXT_RE
 │   │                          #   · MAX_SCALE_RATIO=10       (symmetric clamp)
-│   │                          #   · collectImageReferences() (embeds → ordered edit list)
 │   │                          #   · rewriteWikilinkInner / rewriteStandardAlt
 │   │                          #   · ResizeImagesJob          (run / rewriteContent / dispose)
 │   │
@@ -181,7 +200,7 @@ resize-pics/
 │   │                          #   · CACHE_PATH="resize-pics" (IDB key namespace)
 │   │                          #   · MIN_LINE_CONFIDENCE=60, MIN_LINE_HEIGHT_PX=4
 │   │                          #   · MIN_LINES_REQUIRED=2, TRIM_FRACTION=0.2
-│   │                          #   · ImageTextHeightDetector  (worker lifecycle + Blob URL mgmt)
+│   │                          #   · ImageTextHeightDetector  (detect({bytes} | {resourcePath}))
 │   │                          #   · idbPutAll / evictOcrCache (seed & clear IDB)
 │   │
 │   └── tesseractDeps.js       # Dependency manifest + download / verify / clear
@@ -193,12 +212,13 @@ resize-pics/
 │
 ├── ut/
 │   ├── main.test.js           # Plugin-level: command registration, Notice copy, concurrency gate
-│   ├── resize.test.js         # Editor-level: Markdown-syntax rewrite rules
+│   ├── getPics.test.js        # Image discovery + fetching: PicSource.collectReferences / resolve
+│   ├── resize.test.js         # Editor-level: Markdown-syntax rewrite rules + OCR accounting
 │   ├── settings.test.js       # Settings page: status refresh, button state, download/clear callbacks
 │   ├── tesseractDeps.test.js  # Deps mgmt: cases A/B/C, cancel, IDB cleanup after seed
 │   ├── concurrent.test.js     # Concurrency / lifecycle: async settles across unload
 │   └── helpers/               # Test infrastructure
-│       ├── bootstrap.js       #   · Fake obsidian module + global DOM/IDB stubs
+│       ├── bootstrap.js       #   · Fake obsidian module + global DOM/IDB stubs (incl. requestUrl)
 │       ├── fakePlugin.js      #   · Substitutable plugin/app/adapter/vault fakes
 │       └── loadTesseractDeps.js
 │
@@ -269,6 +289,8 @@ resize-pics/
 | `NOTICE_DURATION_MS` | `4000` | `src/main.js`, `src/settings.js` |
 | `SETTINGS_SCHEMA_VERSION` | `1` | `src/settings.js` |
 | `MAX_SCALE_RATIO` | `10` | `src/resize.js` |
+| `EXTERNAL_FETCH_MAX_ATTEMPTS` | `3` | `src/getPics.js` |
+| `EXTERNAL_FETCH_BACKOFF_MS` | `200` | `src/getPics.js` |
 | `MIN_LINE_CONFIDENCE` | `60` | `src/ocr.js` |
 | `MIN_LINE_HEIGHT_PX` | `4` | `src/ocr.js` |
 | `MIN_LINES_REQUIRED` | `2` | `src/ocr.js` |

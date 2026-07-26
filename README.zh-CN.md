@@ -118,16 +118,26 @@ resize-pics：当前视图中没有找到可缩放的图片。
  │  src/resize.js · ResizeImagesJob.run()                        │
  │  · 读取正文字号 bodyFontPx（getComputedStyle）                 │
  │  · vault.read() 取当前笔记内容                                 │
- │  · metadataCache.getFileCache().embeds 拿到解析器确认的图片位置 │
+ │  · metadataCache.getFileCache() → embeds + sections           │
  └────────────────────────────┬─────────────────────────────────┘
                               │
                               ▼
  ┌──────────────────────────────────────────────────────────────┐
- │  ResizeImagesJob.rewriteContent()                             │
- │  · 按 embeds 逆序遍历图片引用                                   │
- │  · loadImageDimensions() 拿到原始尺寸 naturalWidth             │
+ │  src/getPics.js · PicSource                                   │
+ │  · collectReferences(embeds, sections)：                       │
+ │      本地 (embeds) + 外链 (安全 section 里的正则扫)             │
+ │      合并、按 start 倒序、去重叠                                │
+ │  · resolve(edit) → {kind, tfile|bytes, dims, ...}              │
+ │      - 本地：getResourcePath + loadImageDimensions             │
+ │      - 外链：requestUrl 最多 3 次 + blob URL 取尺寸             │
+ └────────────────────────────┬─────────────────────────────────┘
+                              │
+                              ▼
+ ┌──────────────────────────────────────────────────────────────┐
+ │  ResizeImagesJob.rewriteContent() — 只负责缩放                 │
+ │  · 遍历 edits，按 picSource.resolve().kind 分派                 │
  │  · imageTextHeightDetector.ensureWorker() 首次懒加载 worker     │
- │  · detect() 用 tesseract 识别 → 行高数组 → 20% 截尾均值         │
+ │  · detect({bytes | resourcePath}) → 行高数组 → 20% 截尾均值     │
  │  · newWidth = round(naturalWidth × bodyFontPx / textHeightPx)  │
  │  · 按 wikilink / standard 两种语法回写 size 段                 │
  └────────────────────────────┬─────────────────────────────────┘
@@ -167,11 +177,20 @@ resize-pics/
 │   │                          #   · bilingualError           (语言未定前使用)
 │   │                          #   · localizedError           (语言已定后使用)
 │   │
+│   ├── getPics.js             # 图片发现 + 拉取字节（不含 OCR / 不含改写）
+│   │                          #   · IMAGE_EXT_RE / OCR_SUPPORTED_EXT_RE
+│   │                          #   · EXTERNAL_URL_RE / EXTERNAL_HTTPS_RE
+│   │                          #   · SAFE_SECTION_TYPES = {paragraph, list, blockquote, callout}
+│   │                          #   · EXTERNAL_FETCH_MAX_ATTEMPTS=3、BACKOFF_MS=200
+│   │                          #   · collectImageReferences         (embeds → 编辑列表)
+│   │                          #   · collectExternalImageReferences (sections → 编辑列表)
+│   │                          #   · fetchExternalImageBytes        (requestUrl + 线性退避)
+│   │                          #   · loadImageDimensions[FromBytes] (URL 或 blob URL 通路)
+│   │                          #   · PicSource                       (collectReferences + resolve)
+│   │
 │   ├── resize.js              # 缩放主流程 + Markdown 语法回写
 │   │                          #   · CONTENT_ROOT_SELECTORS   (阅读/编辑视图字号来源)
-│   │                          #   · IMAGE_EXT_RE / OCR_SUPPORTED_EXT_RE
 │   │                          #   · MAX_SCALE_RATIO=10       (双向 clamp)
-│   │                          #   · collectImageReferences() (embeds → 有序编辑列表)
 │   │                          #   · rewriteWikilinkInner / rewriteStandardAlt
 │   │                          #   · ResizeImagesJob          (run / rewriteContent / dispose)
 │   │
@@ -179,7 +198,7 @@ resize-pics/
 │   │                          #   · CACHE_PATH="resize-pics" (IDB key 命名空间)
 │   │                          #   · MIN_LINE_CONFIDENCE=60、MIN_LINE_HEIGHT_PX=4
 │   │                          #   · MIN_LINES_REQUIRED=2、TRIM_FRACTION=0.2
-│   │                          #   · ImageTextHeightDetector  (worker 生命周期 + Blob URL 管理)
+│   │                          #   · ImageTextHeightDetector  (detect({bytes} | {resourcePath}))
 │   │                          #   · idbPutAll / evictOcrCache (seed & 清理 IDB)
 │   │
 │   └── tesseractDeps.js       # 依赖资源清单 + 下载 / 校验 / 清理
@@ -191,12 +210,13 @@ resize-pics/
 │
 ├── ut/
 │   ├── main.test.js           # 插件级：命令注册、Notice 文案、并发闸门
-│   ├── resize.test.js         # 编辑器级：Markdown 语法改写规则
+│   ├── getPics.test.js        # 图片发现 + 拉取：PicSource.collectReferences / resolve
+│   ├── resize.test.js         # 编辑器级：Markdown 语法改写规则 + OCR 记账
 │   ├── settings.test.js       # 设置页：状态刷新、按钮状态、下载/清空回调
 │   ├── tesseractDeps.test.js  # 依赖管理：case A/B/C、cancel、IDB seed 后清理
 │   ├── concurrent.test.js     # 并发/生命周期：unload 期间收敛所有异步
 │   └── helpers/               # 测试基础设施
-│       ├── bootstrap.js       #   · 假 obsidian 模块 + 全局 DOM/IDB stub
+│       ├── bootstrap.js       #   · 假 obsidian 模块 + 全局 DOM/IDB/requestUrl stub
 │       ├── fakePlugin.js      #   · 可替换的 plugin/app/adapter/vault 假体
 │       └── loadTesseractDeps.js
 │
@@ -267,6 +287,8 @@ resize-pics/
 | `NOTICE_DURATION_MS` | `4000` | `src/main.js`、`src/settings.js` |
 | `SETTINGS_SCHEMA_VERSION` | `1` | `src/settings.js` |
 | `MAX_SCALE_RATIO` | `10` | `src/resize.js` |
+| `EXTERNAL_FETCH_MAX_ATTEMPTS` | `3` | `src/getPics.js` |
+| `EXTERNAL_FETCH_BACKOFF_MS` | `200` | `src/getPics.js` |
 | `MIN_LINE_CONFIDENCE` | `60` | `src/ocr.js` |
 | `MIN_LINE_HEIGHT_PX` | `4` | `src/ocr.js` |
 | `MIN_LINES_REQUIRED` | `2` | `src/ocr.js` |

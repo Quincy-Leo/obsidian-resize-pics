@@ -17,11 +17,15 @@ const { makeFakePlugin } = require("./helpers/fakePlugin");
 // 测试策略
 // ---------------------------------------------------------------------------
 //
-// rewriteContent 里唯一的运行时黑箱是 ImageTextHeightDetector：它需要
-// Tesseract worker、需要 blob URL、需要 IndexedDB。这里把 job 的
-// imageTextHeightDetector 直接替换成一个可控 fake（stub），返回值由每个
-// 用例决定。这样可以覆盖 rewriteContent 的正常、跳过、OCR 抛错、缩放越界
-// 和多位置改写分支；任务取消与提交时序由 concurrent.test.js 覆盖。
+// 这里只覆盖 ResizeImagesJob 自己的职责：
+//   · Markdown 语法回写（wikilink / standard 两种，size 段插入/替换）
+//   · OCR 集成（ensureWorker 懒起、detect 异常 / NaN / 越界的记账）
+//   · run() 通往 vault.process 的原子写入、leaf.rebuildView 兜底
+//   · 本地 + 外链图混排时 ResizeImagesJob 的记账（不重复测发现/下载）
+//
+// 图片发现 (collectReferences) 和字节获取 (resolve) 都在 getPics.test.js
+// 里独立覆盖 —— 这里遇到外链/section-scan 相关分支，只用最小 fixture 验证
+// ResizeImagesJob 能正确把 PicSource 的结果拼进结果里。
 
 function makeJob({ imageMap = null, detectFn = null, fileCacheResolver = null } = {}) {
     const plugin = makeFakePlugin({
@@ -42,8 +46,10 @@ function makeJob({ imageMap = null, detectFn = null, fileCacheResolver = null } 
         },
         async terminate() {},
     };
-    // 图片尺寸 stub —— resize.js 通过 loadImageDimensions → new Image() 拿宽高。
+    // 图片尺寸 stub —— PicSource 会 new Image() 或从 blob URL 取尺寸。
     boot.setImageLoader((_url) => ({ ok: true, naturalWidth: 400, naturalHeight: 200 }));
+    // 外链重试测试用 backoff=0，避免真实 setTimeout 等待。
+    job._externalFetchBackoffMs = 0;
     return { plugin, job };
 }
 
@@ -75,28 +81,6 @@ function rewriteWithCache(job, content, references, bodyFontPx = 16) {
     );
 }
 
-/**
- * Build a minimal SectionCache list from a plain `{type, from, to}` spec, where
- * `from`/`to` are literal substrings whose earliest occurrence in `content`
- * anchors the section. Tests use this to hand `rewriteContent` the exact
- * section coverage they need without shipping a real Markdown parser.
- */
-function makeSectionCache(content, specs) {
-    return specs.map(({ type, from, to }) => {
-        const start = content.indexOf(from);
-        assert.notEqual(start, -1, `section start not found: ${from}`);
-        const toIdx = content.indexOf(to, start);
-        assert.notEqual(toIdx, -1, `section end not found: ${to}`);
-        return {
-            type,
-            position: {
-                start: { offset: start },
-                end: { offset: toIdx + to.length },
-            },
-        };
-    });
-}
-
 /** Single paragraph section that spans the whole content string. */
 function wholeParagraphSections(content) {
     return [{
@@ -119,6 +103,10 @@ function stubRequestUrlOk() {
     return () => calls;
 }
 
+// ---------------------------------------------------------------------------
+// run() 前置校验
+// ---------------------------------------------------------------------------
+
 test("Vault.process 不可用时立即报错，不读取或写入文件", async () => {
     const plugin = makeFakePlugin();
     plugin.uiText = LANGUAGE_OPTIONS[0];
@@ -136,6 +124,10 @@ test("Vault.process 不可用时立即报错，不读取或写入文件", async 
     assert.equal(reads, 0);
     assert.equal(writes, 0);
 });
+
+// ---------------------------------------------------------------------------
+// Markdown 语法回写（wikilink / standard）
+// ---------------------------------------------------------------------------
 
 test("wikilink 无 size：追加 size 段", async () => {
     const { job } = makeJob({ detectFn: () => 8 }); // imageTextHeight=8, bodyFont=16 ⇒ scale=2
@@ -183,19 +175,46 @@ test("standard image alt 已有 size 段 → 替换末段", async () => {
     assert.equal(res.newContent, "![alt|400](a.png)");
 });
 
-test("external URL 完全跳过（不计入 considered）", async () => {
-    const { job } = makeJob();
-    const src = "![[https://example.com/a.png]] ![](http://x.com/b.png)";
+test("standard image 保留 title，并支持目标路径中的配对括号", async () => {
+    const { job } = makeJob({ detectFn: () => 16 });
+    const withTitle = '![alt](image.png "title")';
+    const withParens = "![diagram](assets/plot(1).png)";
+    const src = `${withTitle}\n${withParens}`;
     const res = await rewriteWithCache(job, src, [
-        ["![[https://example.com/a.png]]", "https://example.com/a.png"],
-        ["![](http://x.com/b.png)", "http://x.com/b.png"],
+        [withTitle, "image.png"],
+        [withParens, "assets/plot(1).png"],
     ]);
-    assert.equal(res.considered, 0);
-    assert.equal(res.newContent, src);
+
+    assert.equal(res.considered, 2);
+    assert.equal(res.resized, 2);
+    assert.equal(
+        res.newContent,
+        '![alt|400](image.png "title")\n![diagram|400](assets/plot(1).png)',
+    );
 });
 
-test("非图片扩展名 → 不计入 considered", async () => {
+test("splice 从末尾往前，早期 offset 保持有效", async () => {
+    // 两个 wikilink 在同一行；如果先替换前一个，后一个的 start/end 会失效。
+    const { job } = makeJob({ detectFn: () => 16 });
+    const src = "AAA ![[a.png]] BBB ![[b.png]] CCC";
+    const res = await rewriteWithCache(job, src, [
+        ["![[a.png]]", "a.png"],
+        ["![[b.png]]", "b.png"],
+    ]);
+    assert.equal(res.newContent, "AAA ![[a.png|400]] BBB ![[b.png|400]] CCC");
+    assert.equal(res.resized, 2);
+});
+
+// ---------------------------------------------------------------------------
+// ResizeImagesJob 的记账：PicSource 结果 → considered/skipped/resized
+// ---------------------------------------------------------------------------
+//
+// 这几条测试通过 PicSource 的真实行为来观察记账，但不去覆盖 PicSource 内部
+// 逻辑（那部分在 getPics.test.js 里详测）。
+
+test("PicSource.IGNORE → 既不 considered 也不 skipped", async () => {
     const { job } = makeJob();
+    // 非图片扩展名（.md / .txt）会被 PicSource 判为 IGNORE。
     const src = "![[note.md]] ![](README.txt)";
     const res = await rewriteWithCache(job, src, [
         ["![[note.md]]", "note.md"],
@@ -204,7 +223,7 @@ test("非图片扩展名 → 不计入 considered", async () => {
     assert.equal(res.considered, 0);
 });
 
-test("图片存在但 OCR 不支持的格式（svg/gif）→ considered 但 skipped", async () => {
+test("PicSource.SKIP → considered=+1、skipped=+1（OCR 不支持的格式）", async () => {
     const { job } = makeJob();
     const src = "![[a.svg]] ![](b.gif)";
     const res = await rewriteWithCache(job, src, [
@@ -216,7 +235,7 @@ test("图片存在但 OCR 不支持的格式（svg/gif）→ considered 但 skip
     assert.equal(res.resized, 0);
 });
 
-test("linkpath 在 metadataCache 里解析不到 → skipped", async () => {
+test("linkpath 在 metadataCache 里解析不到 → considered+skipped", async () => {
     const plugin = makeFakePlugin({ linkResolver: () => null });
     const job = new ResizeImagesJob(plugin);
     job.imageTextHeightDetector = {
@@ -229,7 +248,7 @@ test("linkpath 在 metadataCache 里解析不到 → skipped", async () => {
     assert.equal(res.resized, 0);
 });
 
-test("Image 加载失败（naturalWidth=0）→ skipped，不触发 ensureWorker", async () => {
+test("Image 加载失败 → skipped，不触发 ensureWorker", async () => {
     const { job } = makeJob();
     boot.setImageLoader(() => ({ ok: false }));
     const src = "![[a.png]]";
@@ -238,6 +257,10 @@ test("Image 加载失败（naturalWidth=0）→ skipped，不触发 ensureWorker
     assert.equal(res.skipped, 1);
     assert.equal(job.imageTextHeightDetector.ensureCalls, 0);
 });
+
+// ---------------------------------------------------------------------------
+// OCR worker 集成：ensureWorker + detect 的错误分支
+// ---------------------------------------------------------------------------
 
 test("ensureWorker 抛错 → 冒泡出 rewriteContent，不被 per-image try 吞掉", async () => {
     const { job } = makeJob();
@@ -282,34 +305,31 @@ test("超出 [1/10, 10] 缩放比 → skipped", async () => {
     assert.equal(res.resized, 0);
 });
 
-test("splice 从末尾往前，早期 offset 保持有效", async () => {
-    // 两个 wikilink 在同一行；如果先替换前一个，后一个的 start/end 会失效。
-    const { job } = makeJob({ detectFn: () => 16 });
-    const src = "AAA ![[a.png]] BBB ![[b.png]] CCC";
-    const res = await rewriteWithCache(job, src, [
-        ["![[a.png]]", "a.png"],
-        ["![[b.png]]", "b.png"],
-    ]);
-    assert.equal(res.newContent, "AAA ![[a.png|400]] BBB ![[b.png|400]] CCC");
-    assert.equal(res.resized, 2);
+test("detect 拿到外链 bytes、本地 bytes=null（验证 PicSource 交接）", async () => {
+    const localOnly = "![[a.png]]";
+    const external = "![](https://ex.com/e.png)";
+    const src = `${localOnly}\n${external}`;
+    const seenInfos = [];
+    const { job } = makeJob({
+        detectFn: (info) => { seenInfos.push(info); return 8; },
+    });
+    stubRequestUrlOk();
+    const embeds = makeEmbedCache(src, [[localOnly, "a.png"]]);
+    const sections = wholeParagraphSections(src);
+
+    await job.rewriteContent(src, "note.md", 16, embeds, sections);
+
+    assert.equal(seenInfos.length, 2);
+    const externalInfo = seenInfos.find((info) => info.bytes);
+    const localInfo = seenInfos.find((info) => !info.bytes);
+    assert.ok(externalInfo && externalInfo.bytes instanceof Uint8Array);
+    assert.equal(externalInfo.resourcePath, null);
+    assert.ok(localInfo && localInfo.tfile && localInfo.resourcePath);
 });
 
-test("URL 编码的路径也能被解析（decodeURIComponent 落地为 vault linkpath）", async () => {
-    // metadataCache 里我们把 linkpath 直接当作路径回吐，
-    // 只要 rewriteContent 能把 %20 解码成空格再查表即可。
-    let seenLink = null;
-    const plugin = makeFakePlugin({
-        linkResolver: (linkpath) => { seenLink = linkpath; return { path: linkpath, __contents: null }; },
-    });
-    const job = new ResizeImagesJob(plugin);
-    job.imageTextHeightDetector = {
-        async ensureWorker() {}, async detect() { return 16; }, async terminate() {},
-    };
-    boot.setImageLoader(() => ({ ok: true, naturalWidth: 400, naturalHeight: 200 }));
-    const src = "![](a%20b.png)";
-    await rewriteWithCache(job, src, [[src, "a%20b.png"]]);
-    assert.equal(seenLink, "a b.png");
-});
+// ---------------------------------------------------------------------------
+// run() 端到端：cache 读取 + vault.process + rebuildView 兜底
+// ---------------------------------------------------------------------------
 
 test("只改 metadata cache 标记的正文 embed，排除 frontmatter、代码和注释", async () => {
     const src = [
@@ -351,24 +371,6 @@ test("只改 metadata cache 标记的正文 embed，排除 frontmatter、代码�
     assert.equal(file.__contents, src.replace("![[body.png]]", "![[body.png|400]]"));
 });
 
-test("standard image 保留 title，并支持目标路径中的配对括号", async () => {
-    const { job } = makeJob({ detectFn: () => 16 });
-    const withTitle = '![alt](image.png "title")';
-    const withParens = "![diagram](assets/plot(1).png)";
-    const src = `${withTitle}\n${withParens}`;
-    const res = await rewriteWithCache(job, src, [
-        [withTitle, "image.png"],
-        [withParens, "assets/plot(1).png"],
-    ]);
-
-    assert.equal(res.considered, 2);
-    assert.equal(res.resized, 2);
-    assert.equal(
-        res.newContent,
-        '![alt|400](image.png "title")\n![diagram|400](assets/plot(1).png)',
-    );
-});
-
 test("缓存缺失或位置陈旧时不回退全文扫描", async () => {
     const { job } = makeJob({ detectFn: () => 16 });
     const src = "![[a.png]]";
@@ -381,6 +383,25 @@ test("缓存缺失或位置陈旧时不回退全文扫描", async () => {
     assert.equal(withoutCache.newContent, src);
     assert.equal(withStaleCache.considered, 0);
     assert.equal(withStaleCache.newContent, src);
+});
+
+test("run() 从 metadataCache 抽 sections 并透传到 rewriteContent（外链集成）", async () => {
+    const src = "正文 ![](https://ex.com/x.png)";
+    const embeds = [];
+    const sections = wholeParagraphSections(src);
+    const { job } = makeJob({
+        detectFn: () => 8,
+        fileCacheResolver: () => ({ embeds, sections }),
+    });
+    stubRequestUrlOk();
+    const file = { path: "note.md", __contents: src };
+    const view = { file, containerEl: { querySelector: () => ({}) } };
+
+    const res = await job.run(view);
+
+    assert.equal(res.considered, 1);
+    assert.equal(res.resized, 1);
+    assert.equal(file.__contents, "正文 ![800](https://ex.com/x.png)");
 });
 
 test("写入成功后调用 leaf.rebuildView() 强制视图刷新", async () => {
@@ -479,475 +500,4 @@ test("leaf.rebuildView 不存在时不报错", async () => {
     assert.equal(res.resized, 1);
     assert.equal(res.aborted, false);
     assert.equal(file.__contents, "![[a.png|800]]");
-});
-
-// ---------------------------------------------------------------------------
-// 外链图片：走 cache.sections 发现 + requestUrl 下载 + OCR
-// ---------------------------------------------------------------------------
-//
-// 所有外链用例都必须先把 job._externalFetchBackoffMs 归零，否则重试测试要
-// 等真实 setTimeout。同时用 makeSectionCache 精确控制哪些 offset 属于
-// paragraph/code/yaml/... —— 我们不复用一个 Markdown 解析器，就靠这个 stub
-// 逐条覆盖 EXTERNAL_IMAGES_NOTES.md 里列的安全 / 不安全 section 类型。
-
-test("外链 paragraph 内的 image → 下载 + OCR + 改写", async () => {
-    const src = "看这张图 ![alt](https://ex.com/a.png) 结束";
-    const { job } = makeJob({ detectFn: () => 8 }); // scale=2 → newWidth=800
-    job._externalFetchBackoffMs = 0;
-    const requestCount = stubRequestUrlOk();
-
-    const res = await job.rewriteContent(
-        src, "note.md", 16, undefined, wholeParagraphSections(src),
-    );
-
-    assert.equal(res.considered, 1);
-    assert.equal(res.resized, 1);
-    assert.equal(res.skipped, 0);
-    assert.equal(res.newContent, "看这张图 ![alt|800](https://ex.com/a.png) 结束");
-    assert.equal(requestCount(), 1, "成功一次不应重试");
-});
-
-test("外链空 alt / 已有 size / caption + size 都能正确改写", async () => {
-    const emptyAlt = "![](https://ex.com/a.png)";
-    const withSize = "![alt|123](https://ex.com/b.png)";
-    const withCap = "![alt|caption|123](https://ex.com/c.png)";
-    const src = `${emptyAlt}\n${withSize}\n${withCap}`;
-    const { job } = makeJob({ detectFn: () => 16 }); // scale=1 → newWidth=400
-    job._externalFetchBackoffMs = 0;
-    stubRequestUrlOk();
-
-    const res = await job.rewriteContent(
-        src, "note.md", 16, undefined, wholeParagraphSections(src),
-    );
-
-    assert.equal(res.considered, 3);
-    assert.equal(res.resized, 3);
-    assert.equal(res.newContent, [
-        "![400](https://ex.com/a.png)",
-        "![alt|400](https://ex.com/b.png)",
-        "![alt|caption|400](https://ex.com/c.png)",
-    ].join("\n"));
-});
-
-test("外链保留 title，只改 alt 中的 size", async () => {
-    const src = '![alt](https://ex.com/a.png "cap")';
-    const { job } = makeJob({ detectFn: () => 8 });
-    job._externalFetchBackoffMs = 0;
-    stubRequestUrlOk();
-
-    const res = await job.rewriteContent(
-        src, "note.md", 16, undefined, wholeParagraphSections(src),
-    );
-
-    assert.equal(res.resized, 1);
-    assert.equal(res.newContent, '![alt|800](https://ex.com/a.png "cap")');
-});
-
-test("外链 URL 带 query/fragment → 从 pathname 判断扩展名", async () => {
-    const isImg = "![](https://ex.com/a.png?v=2#anchor)";
-    const notImg = "![](https://ex.com/api?type=png)";
-    const src = `${isImg}\n${notImg}`;
-    const { job } = makeJob({ detectFn: () => 8 });
-    job._externalFetchBackoffMs = 0;
-    const requestCount = stubRequestUrlOk();
-
-    const res = await job.rewriteContent(
-        src, "note.md", 16, undefined, wholeParagraphSections(src),
-    );
-
-    // notImg 的 pathname 是 "/api"，IMAGE_EXT_RE 不匹配 → 不计 considered
-    assert.equal(res.considered, 1);
-    assert.equal(res.resized, 1);
-    assert.equal(requestCount(), 1, "api URL 不应触发下载");
-    assert.equal(res.newContent, `![800](https://ex.com/a.png?v=2#anchor)\n${notImg}`);
-});
-
-test("外链下载 URL 保持原样（不做 decodeURIComponent）", async () => {
-    // %20 在真实 URL 里代表空格，但请求方要收到 %20 —— 若被 decode 成空格
-    // 服务器就找不到资源。
-    const src = "![](https://ex.com/a%20b.png)";
-    const { job } = makeJob({ detectFn: () => 16 });
-    job._externalFetchBackoffMs = 0;
-    let seenUrl = null;
-    boot.setRequestUrl(async ({ url }) => {
-        seenUrl = url;
-        return { status: 200, arrayBuffer: new ArrayBuffer(4) };
-    });
-
-    const res = await job.rewriteContent(
-        src, "note.md", 16, undefined, wholeParagraphSections(src),
-    );
-
-    assert.equal(res.resized, 1);
-    assert.equal(seenUrl, "https://ex.com/a%20b.png");
-});
-
-test("外链 OCR-不支持格式（svg/gif/avif）→ considered=+1, skipped=+1，无下载", async () => {
-    const src = [
-        "![](https://ex.com/vec.svg)",
-        "![](https://ex.com/anim.gif)",
-        "![](https://ex.com/img.avif)",
-    ].join("\n");
-    const { job } = makeJob();
-    job._externalFetchBackoffMs = 0;
-    let requestCalls = 0;
-    boot.setRequestUrl(async () => { requestCalls += 1; return { status: 200, arrayBuffer: new ArrayBuffer(4) }; });
-
-    const res = await job.rewriteContent(
-        src, "note.md", 16, undefined, wholeParagraphSections(src),
-    );
-
-    assert.equal(res.considered, 3);
-    assert.equal(res.skipped, 3);
-    assert.equal(res.resized, 0);
-    assert.equal(requestCalls, 0, "OCR 不支持的格式不应发起下载");
-    assert.equal(res.newContent, src);
-});
-
-test("外链 requestUrl 前两次失败第三次成功 → 恰好 3 次调用并 resize", async () => {
-    const src = "![](https://ex.com/a.png)";
-    const { job } = makeJob({ detectFn: () => 8 });
-    job._externalFetchBackoffMs = 0;
-    let calls = 0;
-    boot.setRequestUrl(async () => {
-        calls += 1;
-        if (calls < 3) return { status: 500, arrayBuffer: new ArrayBuffer(0) };
-        return { status: 200, arrayBuffer: new ArrayBuffer(4) };
-    });
-
-    const res = await job.rewriteContent(
-        src, "note.md", 16, undefined, wholeParagraphSections(src),
-    );
-
-    assert.equal(calls, 3);
-    assert.equal(res.considered, 1);
-    assert.equal(res.resized, 1);
-    assert.equal(res.newContent, "![800](https://ex.com/a.png)");
-});
-
-test("外链 requestUrl 三次全 500 → skipped=1，batch 其余图不受影响", async () => {
-    const src = [
-        "![](https://ex.com/bad.png)",
-        "",
-        "![](https://ex.com/good.png)",
-    ].join("\n");
-    const { job } = makeJob({ detectFn: () => 8 });
-    job._externalFetchBackoffMs = 0;
-    let badCalls = 0;
-    boot.setRequestUrl(async ({ url }) => {
-        if (url.includes("bad.png")) {
-            badCalls += 1;
-            return { status: 500, arrayBuffer: new ArrayBuffer(0) };
-        }
-        return { status: 200, arrayBuffer: new ArrayBuffer(4) };
-    });
-
-    const res = await job.rewriteContent(
-        src, "note.md", 16, undefined, wholeParagraphSections(src),
-    );
-
-    assert.equal(badCalls, 3, "失败的图应恰好尝试 3 次");
-    assert.equal(res.considered, 2);
-    assert.equal(res.resized, 1);
-    assert.equal(res.skipped, 1);
-    assert.match(res.newContent, /good\.png\)/);
-    assert.ok(res.newContent.includes("![](https://ex.com/bad.png)"), "失败图应保持原文");
-});
-
-test("外链 requestUrl 抛错三次 → skipped，且捕获 exception 不冒泡", async () => {
-    const src = "![](https://ex.com/a.png)";
-    const { job } = makeJob();
-    job._externalFetchBackoffMs = 0;
-    let calls = 0;
-    boot.setRequestUrl(async () => { calls += 1; throw new Error("net down"); });
-
-    const res = await job.rewriteContent(
-        src, "note.md", 16, undefined, wholeParagraphSections(src),
-    );
-
-    assert.equal(calls, 3);
-    assert.equal(res.skipped, 1);
-    assert.equal(res.resized, 0);
-});
-
-test("外链 200 空 body 视为失败并重试", async () => {
-    const src = "![](https://ex.com/a.png)";
-    const { job } = makeJob({ detectFn: () => 8 });
-    job._externalFetchBackoffMs = 0;
-    let calls = 0;
-    boot.setRequestUrl(async () => {
-        calls += 1;
-        return { status: 200, arrayBuffer: new ArrayBuffer(0) };
-    });
-
-    const res = await job.rewriteContent(
-        src, "note.md", 16, undefined, wholeParagraphSections(src),
-    );
-
-    assert.equal(calls, 3);
-    assert.equal(res.skipped, 1);
-});
-
-test("外链下载成功但 Image 加载失败 → skipped，不触发 detect", async () => {
-    const src = "![](https://ex.com/a.png)";
-    const { job } = makeJob();
-    job._externalFetchBackoffMs = 0;
-    stubRequestUrlOk();
-    // blob URL 加载失败：Image.onerror 触发 → null dims
-    boot.setImageLoader((url) => {
-        if (String(url).startsWith("blob:")) return { ok: false };
-        return { ok: true, naturalWidth: 400, naturalHeight: 200 };
-    });
-    let detectCalls = 0;
-    job.imageTextHeightDetector.detect = async () => { detectCalls += 1; return 8; };
-
-    const res = await job.rewriteContent(
-        src, "note.md", 16, undefined, wholeParagraphSections(src),
-    );
-
-    assert.equal(res.considered, 1);
-    assert.equal(res.skipped, 1);
-    assert.equal(res.resized, 0);
-    assert.equal(detectCalls, 0, "dims 失败应直接跳过，不调用 detect");
-});
-
-test("外链 detect 收到 Uint8Array bytes，本地 detect 收到 bytes=null", async () => {
-    const localOnly = "![[a.png]]";
-    const external = "![](https://ex.com/e.png)";
-    const src = `${localOnly}\n${external}`;
-    const seenInfos = [];
-    const { job } = makeJob({
-        detectFn: (info) => { seenInfos.push(info); return 8; },
-    });
-    job._externalFetchBackoffMs = 0;
-    stubRequestUrlOk();
-    const embeds = makeEmbedCache(src, [[localOnly, "a.png"]]);
-    const sections = wholeParagraphSections(src);
-
-    await job.rewriteContent(src, "note.md", 16, embeds, sections);
-
-    assert.equal(seenInfos.length, 2);
-    // 因为 splice 从末尾往前处理，external 先，local 后。
-    const externalInfo = seenInfos.find((info) => info.bytes);
-    const localInfo = seenInfos.find((info) => !info.bytes);
-    assert.ok(externalInfo, "外链 info 应有 bytes 字段");
-    assert.ok(externalInfo.bytes instanceof Uint8Array);
-    assert.equal(externalInfo.resourcePath, null);
-    assert.ok(localInfo, "本地 info 应存在");
-    assert.ok(localInfo.tfile, "本地 info 应有 tfile");
-    assert.ok(localInfo.resourcePath, "本地 info 应有 resourcePath");
-});
-
-test("本地图 + 外链图混排 → 都改写，且 splice 顺序正确", async () => {
-    const src = "AAA ![[a.png]] BBB ![](https://ex.com/b.png) CCC";
-    const embeds = makeEmbedCache(src, [["![[a.png]]", "a.png"]]);
-    const sections = wholeParagraphSections(src);
-    const { job } = makeJob({ detectFn: () => 8 });
-    job._externalFetchBackoffMs = 0;
-    stubRequestUrlOk();
-
-    const res = await job.rewriteContent(src, "note.md", 16, embeds, sections);
-
-    assert.equal(res.considered, 2);
-    assert.equal(res.resized, 2);
-    assert.equal(
-        res.newContent,
-        "AAA ![[a.png|800]] BBB ![800](https://ex.com/b.png) CCC",
-    );
-});
-
-test("非白名单 section（yaml / code / html / comment / heading）里的外链 → 不改", async () => {
-    const src = [
-        "---",                             // 0
-        '"![](https://ex.com/y.png)"',     // yaml
-        "---",
-        "",
-        "# ![](https://ex.com/h.png)",     // heading
-        "",
-        "<!-- ![](https://ex.com/c.png) -->",
-        "",
-        "```",
-        "![](https://ex.com/f.png)",       // code
-        "```",
-        "",
-        "<div>![](https://ex.com/r.png)</div>", // html
-    ].join("\n");
-    const sections = [
-        { type: "yaml", from: "---", to: "---" },
-        { type: "heading", from: "# ![](https://ex.com/h.png)", to: "png)" },
-        { type: "comment", from: "<!--", to: "-->" },
-        { type: "code", from: "```", to: "```" },
-        { type: "html", from: "<div>", to: "</div>" },
-    ].map((spec) => {
-        // 用带索引的手工版避免 makeSectionCache 的 indexOf 撞名重复。
-        const start = src.indexOf(spec.from);
-        const secondIdx = spec.from === "---" || spec.from === "```"
-            ? src.indexOf(spec.to, start + spec.from.length)
-            : src.indexOf(spec.to, start);
-        assert.notEqual(start, -1);
-        assert.notEqual(secondIdx, -1);
-        return {
-            type: spec.type,
-            position: {
-                start: { offset: start },
-                end: { offset: secondIdx + spec.to.length },
-            },
-        };
-    });
-    const { job } = makeJob({ detectFn: () => 8 });
-    job._externalFetchBackoffMs = 0;
-    let requestCalls = 0;
-    boot.setRequestUrl(async () => { requestCalls += 1; return { status: 200, arrayBuffer: new ArrayBuffer(4) }; });
-
-    const res = await job.rewriteContent(src, "note.md", 16, undefined, sections);
-
-    assert.equal(res.considered, 0);
-    assert.equal(res.newContent, src);
-    assert.equal(requestCalls, 0);
-});
-
-test("callout / list / blockquote section 内的外链 → 都可扫", async () => {
-    const src = [
-        "- ![](https://ex.com/li.png)",
-        "",
-        "> ![](https://ex.com/bq.png)",
-        "",
-        "> [!note] ![](https://ex.com/cal.png)",
-    ].join("\n");
-    const sections = [
-        { type: "list", from: "- ![](https://ex.com/li.png)", to: "png)" },
-        { type: "blockquote", from: "> ![](https://ex.com/bq.png)", to: "png)" },
-        { type: "callout", from: "> [!note]", to: "cal.png)" },
-    ].map((spec) => {
-        const start = src.indexOf(spec.from);
-        const endIdx = src.indexOf(spec.to, start);
-        return {
-            type: spec.type,
-            position: {
-                start: { offset: start },
-                end: { offset: endIdx + spec.to.length },
-            },
-        };
-    });
-    const { job } = makeJob({ detectFn: () => 8 });
-    job._externalFetchBackoffMs = 0;
-    stubRequestUrlOk();
-
-    const res = await job.rewriteContent(src, "note.md", 16, undefined, sections);
-
-    assert.equal(res.considered, 3);
-    assert.equal(res.resized, 3);
-});
-
-test("paragraph 内的反引号 span 不参与外链扫描", async () => {
-    // markdown 教程里的 `![](https://…)` 是文档示例，不能被改写。
-    const src = "语法示例 `![](https://ex.com/x.png)` 真图 ![](https://ex.com/y.png)";
-    const { job } = makeJob({ detectFn: () => 8 });
-    job._externalFetchBackoffMs = 0;
-    const requestUrls = [];
-    boot.setRequestUrl(async ({ url }) => {
-        requestUrls.push(url);
-        return { status: 200, arrayBuffer: new ArrayBuffer(4) };
-    });
-
-    const res = await job.rewriteContent(
-        src, "note.md", 16, undefined, wholeParagraphSections(src),
-    );
-
-    assert.equal(res.considered, 1);
-    assert.equal(res.resized, 1);
-    assert.deepEqual(requestUrls, ["https://ex.com/y.png"]);
-    assert.ok(
-        res.newContent.includes("`![](https://ex.com/x.png)`"),
-        "反引号内的示例应完整保留",
-    );
-});
-
-test("外链 file:// / app:// / data: URL → 不参与外链扫描", async () => {
-    const src = [
-        "![](file:///a.png)",
-        "![](app://vault/b.png)",
-        "![](data:image/png;base64,AAA=)",
-    ].join("\n");
-    const { job } = makeJob();
-    job._externalFetchBackoffMs = 0;
-    let requestCalls = 0;
-    boot.setRequestUrl(async () => { requestCalls += 1; return { status: 200, arrayBuffer: new ArrayBuffer(4) }; });
-
-    const res = await job.rewriteContent(
-        src, "note.md", 16, undefined, wholeParagraphSections(src),
-    );
-
-    assert.equal(res.considered, 0);
-    assert.equal(requestCalls, 0);
-    assert.equal(res.newContent, src);
-});
-
-test("sections 缺失 → 外链不扫（保持既有安全语义）", async () => {
-    const src = "![](https://ex.com/a.png)";
-    const { job } = makeJob({ detectFn: () => 8 });
-    job._externalFetchBackoffMs = 0;
-    let requestCalls = 0;
-    boot.setRequestUrl(async () => { requestCalls += 1; return { status: 200, arrayBuffer: new ArrayBuffer(4) }; });
-
-    const res = await job.rewriteContent(src, "note.md", 16, undefined, undefined);
-
-    assert.equal(res.considered, 0);
-    assert.equal(requestCalls, 0);
-    assert.equal(res.newContent, src);
-});
-
-test("同一 URL 重复引用 → 各自独立下载（不做请求级去重）", async () => {
-    const src = "![](https://ex.com/a.png) 又是它 ![](https://ex.com/a.png)";
-    const { job } = makeJob({ detectFn: () => 8 });
-    job._externalFetchBackoffMs = 0;
-    const requestCount = stubRequestUrlOk();
-
-    const res = await job.rewriteContent(
-        src, "note.md", 16, undefined, wholeParagraphSections(src),
-    );
-
-    assert.equal(res.considered, 2);
-    assert.equal(res.resized, 2);
-    assert.equal(requestCount(), 2);
-});
-
-test("URL 里含 `)` → 正则截断，安全跳过", async () => {
-    // Wikipedia 风格链接：pathname 里带未转义的 `)`。既有正则会把 URL 截到
-    // 第一个 `)`，导致 match[0] 与 content.slice(start, end) 不一致，整个
-    // 引用被丢弃 —— 内容原样保留，也不会发起错误请求。
-    const src = "![](https://en.wikipedia.org/wiki/Foo_(bar).png)";
-    const { job } = makeJob({ detectFn: () => 8 });
-    job._externalFetchBackoffMs = 0;
-    let requestCalls = 0;
-    boot.setRequestUrl(async () => { requestCalls += 1; return { status: 200, arrayBuffer: new ArrayBuffer(4) }; });
-
-    const res = await job.rewriteContent(
-        src, "note.md", 16, undefined, wholeParagraphSections(src),
-    );
-
-    assert.equal(res.considered, 0);
-    assert.equal(requestCalls, 0);
-    assert.equal(res.newContent, src);
-});
-
-test("run() 从 metadataCache 抽 sections 并透传到 rewriteContent", async () => {
-    // 集成风格：从 run() 入口进，验证 sections 通路完整。
-    const src = "正文 ![](https://ex.com/x.png)";
-    const embeds = [];
-    const sections = wholeParagraphSections(src);
-    const { job, plugin } = makeJob({
-        detectFn: () => 8,
-        fileCacheResolver: () => ({ embeds, sections }),
-    });
-    job._externalFetchBackoffMs = 0;
-    stubRequestUrlOk();
-    const file = { path: "note.md", __contents: src };
-    const view = { file, containerEl: { querySelector: () => ({}) } };
-
-    const res = await job.run(view);
-
-    assert.equal(res.considered, 1);
-    assert.equal(res.resized, 1);
-    assert.equal(file.__contents, "正文 ![800](https://ex.com/x.png)");
 });
