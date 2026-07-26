@@ -177,6 +177,8 @@ class ResizePicsPlugin extends Plugin {
         }
 
         this.resizing = true;
+        new Notice(this.uiText.notice.start, NOTICE_DURATION_MS);
+
         const lifecycleGeneration = this._lifecycleGeneration;
         const job = this.resizeJob;
         try {

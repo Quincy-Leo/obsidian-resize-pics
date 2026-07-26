@@ -338,3 +338,101 @@ test("缓存缺失或位置陈旧时不回退全文扫描", async () => {
     assert.equal(withStaleCache.considered, 0);
     assert.equal(withStaleCache.newContent, src);
 });
+
+test("写入成功后调用 leaf.rebuildView() 强制视图刷新", async () => {
+    // Obsidian 对源码微小变化（如 `|500` → `|1000`）经常不重算 <img>
+    // 尺寸，用户就得手动切模式或切文件；写入后 rebuildView 才能把新
+    // 宽度立刻反映到当前视图。
+    const src = "![[a.png]]";
+    const embeds = makeEmbedCache(src, [[src, "a.png"]]);
+    const { job } = makeJob({
+        detectFn: () => 8, // scale=2，触发实际改写
+        fileCacheResolver: () => ({ embeds }),
+    });
+    const file = { path: "note.md", __contents: src };
+    let rebuilds = 0;
+    const view = {
+        file,
+        containerEl: { querySelector: () => ({}) },
+        leaf: { rebuildView() { rebuilds += 1; } },
+    };
+
+    const res = await job.run(view);
+
+    assert.equal(res.resized, 1);
+    assert.equal(res.aborted, false);
+    assert.equal(file.__contents, "![[a.png|800]]");
+    assert.equal(rebuilds, 1);
+});
+
+test("内容未变化时不调用 rebuildView", async () => {
+    // 已经是目标宽度，rewriteContent 不改任何字符，跳过写入分支自然
+    // 也应该跳过 rebuildView —— 避免无实际修改时白白重建视图。
+    const src = "![[a.png|400]]";
+    const embeds = makeEmbedCache(src, [[src, "a.png"]]);
+    const { job } = makeJob({
+        detectFn: () => 16, // scale=1，newWidth=400，与已有值一致
+        fileCacheResolver: () => ({ embeds }),
+    });
+    const file = { path: "note.md", __contents: src };
+    let rebuilds = 0;
+    const view = {
+        file,
+        containerEl: { querySelector: () => ({}) },
+        leaf: { rebuildView() { rebuilds += 1; } },
+    };
+
+    const res = await job.run(view);
+
+    assert.equal(res.resized, 1);
+    assert.equal(res.aborted, false);
+    assert.equal(file.__contents, src);
+    assert.equal(rebuilds, 0);
+});
+
+test("rebuildView 抛错不会让整个 run 报错", async () => {
+    // rebuildView 是 Obsidian 的非文档 API，未来可能移除或改签名；
+    // 即使它抛错，写入已经成功，run 应该照常返回成功结果，不能把
+    // 一次成功的 resize 变成失败上报给用户。
+    const src = "![[a.png]]";
+    const embeds = makeEmbedCache(src, [[src, "a.png"]]);
+    const { job } = makeJob({
+        detectFn: () => 8,
+        fileCacheResolver: () => ({ embeds }),
+    });
+    const file = { path: "note.md", __contents: src };
+    const view = {
+        file,
+        containerEl: { querySelector: () => ({}) },
+        leaf: { rebuildView() { throw new Error("boom"); } },
+    };
+
+    const res = await job.run(view);
+
+    assert.equal(res.resized, 1);
+    assert.equal(res.aborted, false);
+    assert.equal(file.__contents, "![[a.png|800]]");
+});
+
+test("leaf.rebuildView 不存在时不报错", async () => {
+    // 老版本 Obsidian 或未来的 API 变动可能让 rebuildView 消失；缺失
+    // 时应该静默跳过刷新而不是抛错。
+    const src = "![[a.png]]";
+    const embeds = makeEmbedCache(src, [[src, "a.png"]]);
+    const { job } = makeJob({
+        detectFn: () => 8,
+        fileCacheResolver: () => ({ embeds }),
+    });
+    const file = { path: "note.md", __contents: src };
+    const view = {
+        file,
+        containerEl: { querySelector: () => ({}) },
+        leaf: {}, // no rebuildView
+    };
+
+    const res = await job.run(view);
+
+    assert.equal(res.resized, 1);
+    assert.equal(res.aborted, false);
+    assert.equal(file.__contents, "![[a.png|800]]");
+});

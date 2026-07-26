@@ -341,6 +341,23 @@ class ResizeImagesJob {
                 return this._cancelledResult({ considered, resized, skipped });
             }
             if (!accepted || conflict) return { considered, resized, skipped, aborted: true };
+
+            // vault.process fires a `modify` event, but for tiny source-only
+            // changes like a width segment (`|500` → `|1000`) both reading
+            // view and Live Preview commonly keep the existing <img> element
+            // and skip re-running the size rules, so the new width doesn't
+            // reach the DOM until the user switches modes or reopens the
+            // file. Force a leaf rebuild so the new size takes effect in
+            // whatever mode the view is currently in. Guarded because
+            // rebuildView is undocumented API and any failure here must not
+            // turn a successful write into a reported failure.
+            if (view.leaf && typeof view.leaf.rebuildView === "function") {
+                try {
+                    view.leaf.rebuildView();
+                } catch (error) {
+                    console.error("resize-pics: rebuildView failed after resize", error);
+                }
+            }
         }
 
         return { considered, resized, skipped, aborted: false };

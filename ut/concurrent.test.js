@@ -183,7 +183,9 @@ test("[01] 快速连续触发两次 resize：真实命令入口只能启动一�
 
     assert.equal(runCalls, 1, "第二次触发应被 resizing 锁合并");
     assert.equal(plugin.resizing, false, "首个任务结束后必须释放 resizing 锁");
-    assert.equal(boot.noticeLog.length, 1, "只应汇报一次 resize 结果");
+    // 第一次调用会弹「起始」+「结果」两条 Notice；第二次调用被
+    // resizing 锁在 start Notice 之前拦住，不该再新增任何 Notice。
+    assert.equal(boot.noticeLog.length, 2, "只应有一次 resize 的起始+结果 Notice");
 });
 
 test("[02] OCR 期间用户编辑文件：提交前复查应 abort，且保留用户内容", async () => {

@@ -21,6 +21,7 @@ const LANGUAGE_OPTIONS = [
             noImages: "resize-pics：当前视图中没有找到可缩放的图片。",
             resized: "resize-pics：已缩放 {count} 张图片（跳过 {skipped} 张）。",
             aborted: "resize-pics：检测期间不要编辑文件，请重试。",
+            start: "resize-pics：正在缩放图片……",
         },
         error: {
             settingsMissingVersion:
@@ -73,6 +74,7 @@ const LANGUAGE_OPTIONS = [
             noImages: "resize-pics: no resizable images found in the current view.",
             resized: "resize-pics: resized {count} image(s) (skipped {skipped}).",
             aborted: "resize-pics: Do not edit file during detection. Please try again.",
+            start: "resize-pics: resizing images…",
         },
         error: {
             settingsMissingVersion:

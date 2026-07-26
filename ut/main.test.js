@@ -78,13 +78,38 @@ test("没有 MarkdownView → 弹 noView（用当前语言）", async () => {
     assert.match(boot.noticeLog[0].message, /请先打开一个 Markdown 视图/);
 });
 
+test("按下命令后立刻弹起始 Notice，run 完成前用户能看到反馈", async () => {
+    boot.resetNotices();
+    // 让 run 在我们释放之前一直挂起 —— 断言起始 Notice 在 run 完成前
+    // 就已经进入 log。
+    let release;
+    const runFinished = new Promise((resolve) => { release = resolve; });
+    const plugin = await bootPlugin(() => runFinished
+        .then(() => ({ considered: 1, resized: 1, skipped: 0, aborted: false })));
+    plugin.__setActiveView(fakeView());
+    const done = plugin.resizePicsToFontSize();
+
+    // 让 microtask 队列跑完，起始 Notice 应该已经落地。
+    await Promise.resolve();
+    assert.equal(boot.noticeLog.length, 1);
+    assert.match(boot.noticeLog[0].message, /正在缩放图片/);
+
+    release();
+    await done;
+    // 完成后应追加一条结果 Notice。
+    assert.equal(boot.noticeLog.length, 2);
+    assert.match(boot.noticeLog[1].message, /已缩放 1 张图片/);
+});
+
 test("run 返回 aborted → 弹 aborted，不弹 resized", async () => {
     boot.resetNotices();
     const plugin = await bootPlugin({ considered: 3, resized: 0, skipped: 0, aborted: true });
     plugin.__setActiveView(fakeView());
     await plugin.resizePicsToFontSize();
-    assert.equal(boot.noticeLog.length, 1);
-    assert.match(boot.noticeLog[0].message, /不要编辑文件/);
+    // 起始 Notice + aborted Notice
+    assert.equal(boot.noticeLog.length, 2);
+    assert.match(boot.noticeLog[0].message, /正在缩放图片/);
+    assert.match(boot.noticeLog[1].message, /不要编辑文件/);
 });
 
 test("run 返回 considered=0 → 弹 noImages", async () => {
@@ -92,7 +117,8 @@ test("run 返回 considered=0 → 弹 noImages", async () => {
     const plugin = await bootPlugin({ considered: 0, resized: 0, skipped: 0, aborted: false });
     plugin.__setActiveView(fakeView());
     await plugin.resizePicsToFontSize();
-    assert.match(boot.noticeLog[0].message, /没有找到可缩放的图片/);
+    // 起始 Notice + noImages Notice
+    assert.match(boot.noticeLog[1].message, /没有找到可缩放的图片/);
 });
 
 test("run 正常 → 弹 resized，模板参数填对", async () => {
@@ -100,8 +126,9 @@ test("run 正常 → 弹 resized，模板参数填对", async () => {
     const plugin = await bootPlugin({ considered: 5, resized: 3, skipped: 2, aborted: false });
     plugin.__setActiveView(fakeView());
     await plugin.resizePicsToFontSize();
+    // 起始 Notice + 结果 Notice
     // 中文模板 "已缩放 {count} 张图片（跳过 {skipped} 张）"
-    assert.match(boot.noticeLog[0].message, /已缩放 3 张图片（跳过 2 张）/);
+    assert.match(boot.noticeLog[1].message, /已缩放 3 张图片（跳过 2 张）/);
 });
 
 test("run 抛已本地化错误 → 不重复 resize-pics 前缀", async () => {
@@ -109,7 +136,8 @@ test("run 抛已本地化错误 → 不重复 resize-pics 前缀", async () => {
     const plugin = await bootPlugin(() => { throw new Error("resize-pics：某个内部错误"); });
     plugin.__setActiveView(fakeView());
     await plugin.resizePicsToFontSize();
-    const msg = boot.noticeLog[0].message;
+    // 起始 Notice + 错误 Notice
+    const msg = boot.noticeLog[1].message;
     // 应该只有一次 "resize-pics：" —— 匹配的字符串出现次数 = 1
     const count = msg.split(/resize-pics[:：]/).length - 1;
     assert.equal(count, 1);
@@ -120,7 +148,8 @@ test("run 抛裸错误 → 手动加 resize-pics: 前缀", async () => {
     const plugin = await bootPlugin(() => { throw new Error("random exception"); });
     plugin.__setActiveView(fakeView());
     await plugin.resizePicsToFontSize();
-    assert.match(boot.noticeLog[0].message, /^resize-pics: random exception$/);
+    // 起始 Notice + 错误 Notice
+    assert.match(boot.noticeLog[1].message, /^resize-pics: random exception$/);
 });
 
 test("成功后 resizing 复位为 false，可再次触发", async () => {
