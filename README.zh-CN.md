@@ -281,7 +281,7 @@ resize-pics/
 
 | 常量 | 值 | 位置 |
 |---|---|---|
-| `PLUGIN_VERSION` | `0.1.0` | `src/main.js` |
+| `PLUGIN_VERSION` | `0.2.0` | `src/main.js` |
 | `RESIZE_COMMAND_ID` | `"resize-pics-to-font-size"` | `src/main.js` |
 | `RIBBON_ICON_ID` | `"image-upscale"` | `src/main.js` |
 | `NOTICE_DURATION_MS` | `4000` | `src/main.js`、`src/settings.js` |
