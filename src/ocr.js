@@ -100,10 +100,13 @@ class ImageTextHeightDetector {
     }
 
     /**
-     * @param {{tfile: import("obsidian").TFile, resourcePath: string, naturalWidth: number, naturalHeight: number}} info
-     *     Loaded image context. Only `resourcePath` is used — the image
-     *     bytes are fetched on the main thread (same-origin from the
-     *     renderer) and shipped into the worker as an ArrayBuffer.
+     * @param {{tfile: import("obsidian").TFile | null, resourcePath: string | null, bytes?: Uint8Array | ArrayBuffer | null, naturalWidth: number, naturalHeight: number}} info
+     *     Loaded image context. When `bytes` is provided (external images that
+     *     were already downloaded on the main thread) it's shipped straight into
+     *     the worker; otherwise the resource is fetched from `resourcePath`.
+     *     A worker-side fetch of `app://<uuid>` would fail cross-origin the same
+     *     way the worker script did, so vault-backed reads still go through
+     *     main-thread `fetch()`.
      * @returns {Promise<number>} Text height in CSS pixels at the image's
      *     natural size, or NaN when fewer than two usable lines are detected.
      */
@@ -112,10 +115,20 @@ class ImageTextHeightDetector {
             throw new Error(localizedError(this.plugin.uiText, "ocrDetectBeforeEnsure"));
         }
         const worker = await this._workerPromise;
-        // Fetch on the main thread; a worker-side fetch of `app://<uuid>`
-        // would fail cross-origin the same way the worker script did.
-        const response = await fetch(info.resourcePath);
-        const bytes = new Uint8Array(await response.arrayBuffer());
+        let bytes;
+        if (info && info.bytes) {
+            // Pre-downloaded bytes (external image). Normalize both
+            // `ArrayBuffer` and typed-array views to a `Uint8Array` that
+            // `worker.recognize` accepts as-is.
+            bytes = ArrayBuffer.isView(info.bytes)
+                ? new Uint8Array(info.bytes.buffer, info.bytes.byteOffset, info.bytes.byteLength)
+                : new Uint8Array(info.bytes);
+        } else {
+            // Fetch on the main thread; a worker-side fetch of `app://<uuid>`
+            // would fail cross-origin the same way the worker script did.
+            const response = await fetch(info.resourcePath);
+            bytes = new Uint8Array(await response.arrayBuffer());
+        }
         const { data } = await worker.recognize(bytes, {}, { blocks: true });
         const heights = collectLineHeights(data.lines);
         if (heights.length < MIN_LINES_REQUIRED) return NaN;

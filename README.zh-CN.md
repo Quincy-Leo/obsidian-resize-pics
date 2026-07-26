@@ -221,7 +221,7 @@ resize-pics/
 
 - **仅桌面端**（`isDesktopOnly: true`）：tesseract.js worker + WASM 依赖桌面 Electron 环境
 - **可 OCR 的格式**：`png`、`jpg` / `jpeg`、`webp`、`bmp`。文档里被 Obsidian 认为是图片但 tesseract 无法解码的格式（`gif`、`svg`、`avif`、`tiff`）会被计入"考虑过但跳过"
-- **外链图片不缩放**：以 `http://` / `https://` / `file://` 等 URI scheme 开头的引用一律跳过（避免在检测期间发起大量网络请求）
+- **外链图片按需下载识别**：`![alt](https://…/x.png)` 不在 Obsidian 的 `metadataCache.embeds` 里，插件通过扫描 `cache.sections` 中的正文段落（`paragraph`/`list`/`blockquote`/`callout`）识别外链，再用 `requestUrl`（Obsidian 内置的 CORS 免疫 HTTP 客户端）下载，每张图最多重试 3 次，随后走与本地图完全相同的 OCR + 缩放公式；`file://` / `app://` / `data:` 等非 http(s) URI 仍然跳过
 - **规模钳制**：`bodyFontPx / imageTextHeightPx` 的比例被限制在 `[1/10, 10]` 之间；超出这个范围的图片被识别为"文字高度极端异常"（多半是 OCR 误识 1px 噪点），跳过
 - **要求 ≥ 2 行有效文本**：单行文本样本量太小，容易被误识别的行拉偏均值；少于 2 行的图片跳过
 - **锚点检测最少置信度 = 60**：单行低于此置信度会被丢弃；虚线边框、JPEG 分块伪影、单像素点很容易被 tesseract 当作 1-px 高的"文字"

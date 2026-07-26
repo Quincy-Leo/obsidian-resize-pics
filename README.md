@@ -223,7 +223,7 @@ resize-pics/
 
 - **Desktop only** (`isDesktopOnly: true`): the tesseract.js worker + WASM depends on desktop Electron
 - **OCR-supported formats**: `png`, `jpg` / `jpeg`, `webp`, `bmp`. Formats Obsidian recognizes as images but tesseract can't decode (`gif`, `svg`, `avif`, `tiff`) are counted as "considered but skipped"
-- **External images are not resized**: any reference starting with a URI scheme such as `http://` / `https://` / `file://` is skipped (to avoid firing off large numbers of network requests during detection)
+- **External images are downloaded, verified in `cache.sections`, retried up to 3× per image**: `![alt](https://…/x.png)` doesn't appear in Obsidian's `metadataCache.embeds`, so the plugin scans body-level `cache.sections` (`paragraph`, `list`, `blockquote`, `callout`) for the syntax, then downloads via `requestUrl` (Obsidian's CORS-immune HTTP client) and runs the same OCR + size-formula path as local images. Non-`http(s)` URIs (`file://`, `app://`, `data:`) are still skipped
 - **Scale clamp**: the `bodyFontPx / imageTextHeightPx` ratio is clamped to `[1/10, 10]`; images outside that range are treated as "extreme text-height outliers" (usually a 1-px noise pixel misrecognized as text) and skipped
 - **≥ 2 usable lines required**: a single line is too small a sample and can be pulled around by a misrecognized line; images with fewer usable lines are skipped
 - **Minimum line confidence = 60**: any line below this confidence is dropped; dashed borders, JPEG blocking artefacts, and single-pixel dust are frequently seen as 1-px-tall "text" by tesseract

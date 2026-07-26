@@ -5,6 +5,7 @@
 
 "use strict";
 
+const { requestUrl } = require("obsidian");
 const { localizedError } = require("./settings");
 const { ImageTextHeightDetector } = require("./ocr");
 
@@ -28,9 +29,46 @@ const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|svg|avif|tiff?)$/i;
 //   matches: "foo.png", "bar.JPG", "diagrams/x.webp"    mismatches: "anim.gif", "vector.svg", "shot.tiff"
 const OCR_SUPPORTED_EXT_RE = /\.(png|jpe?g|webp|bmp|pbm)$/i;
 
-// URI schemes we treat as external and never rewrite.
-//   matches: "https://x.com/a.png", "http://…", "file://…"    mismatches: "foo.png", "sub/foo.png"
+// URI schemes we don't try to read as vault files.
+//   matches: "https://x.com/a.png", "http://…", "file://…", "data:image/…"
+//   mismatches: "foo.png", "sub/foo.png"
 const EXTERNAL_URL_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+// The narrow slice of external URLs we CAN download over the network — anchored
+// at http/https only, per EXTERNAL_IMAGES_NOTES.md's rule: file://, app://,
+// data: and other schemes are silently skipped.
+const EXTERNAL_HTTPS_RE = /^https?:\/\//i;
+
+// Standard-form external image reference: `![alt](https?://url "optional title")`.
+// Kept intentionally simple — nested `[]` in alt, escaped `\]`, and parenthesised
+// URLs are not matched. EXTERNAL_IMAGES_NOTES.md explicitly documents this as
+// "safely skip on doubt": external images in the wild almost never contain those.
+const EXTERNAL_STANDARD_IMAGE_RE = /!\[([^\]\n]*)\]\((https?:\/\/[^\s()]+)(?:\s+"[^"]*")?\)/gi;
+
+// SectionCache.type values that can legitimately contain body-level Markdown
+// image syntax. Everything else (`yaml`, `code`, `html`, `comment`, `heading`,
+// `thematicBreak`, …) is out of scope — scanning them would false-positive on
+// literal `![alt](...)` strings inside frontmatter, fenced code, or comments.
+const SAFE_SECTION_TYPES = new Set(["paragraph", "list", "blockquote", "callout"]);
+
+// Inline `` `…` `` spans inside a paragraph must NOT be scanned — a code
+// example like `` `![](https://real-url/x.png)` `` would otherwise be picked
+// up. We mask them out with equal-length spaces so match offsets stay aligned
+// with the original slice. Multi-line and fenced code blocks are already
+// excluded via SAFE_SECTION_TYPES.
+const INLINE_CODE_SPAN_RE = /`+[^`\n]*?`+/g;
+
+// External image download retries. Each attempt calls `requestUrl` once; on
+// non-2xx / empty body / thrown error, wait EXTERNAL_FETCH_BACKOFF_MS × attempt
+// before the next attempt. Three attempts × 200 ms linear backoff bounds the
+// worst-case wall clock at ~600 ms of sleep for a single failed image.
+const EXTERNAL_FETCH_MAX_ATTEMPTS = 3;
+const EXTERNAL_FETCH_BACKOFF_MS = 200;
+
+// Cancellation-aware sleep granularity. The sleep chunk is small so that a
+// user cancel is observed at ~50 ms latency even when a full backoff is in
+// flight.
+const CANCEL_POLL_MS = 50;
 
 // Symmetric sanity clamp on bodyFontPx / imageTextHeightPx: refuse to
 // resize when the ratio is more than this many × away from 1 in either
@@ -82,6 +120,127 @@ function loadImageDimensions(url) {
         image.onerror = () => resolve(null);
         image.src = url;
     });
+}
+
+/**
+ * Same as {@link loadImageDimensions} but starting from already-downloaded
+ * bytes rather than a URL Obsidian can serve. Used for external images we
+ * fetched over the network — we mint a short-lived `blob:` URL so `<img>`
+ * can decode the bytes locally, then revoke it once decoding is done.
+ * @param {Uint8Array | ArrayBuffer} bytes
+ * @returns {Promise<{naturalWidth: number, naturalHeight: number} | null>}
+ */
+async function loadImageDimensionsFromBytes(bytes) {
+    const view = ArrayBuffer.isView(bytes)
+        ? new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+        : new Uint8Array(bytes);
+    const blob = new Blob([view]);
+    const url = URL.createObjectURL(blob);
+    try {
+        return await loadImageDimensions(url);
+    } finally {
+        // Revocation must happen after `<img>` has decoded (which the
+        // await above guarantees) — earlier revocation would race the
+        // decode. Guard against test stubs that may not have revokeObjectURL.
+        try { URL.revokeObjectURL(url); } catch (_) { /* ignore */ }
+    }
+}
+
+/**
+ * Sleep for at most `ms` milliseconds, waking up every {@link CANCEL_POLL_MS}
+ * to give `isCancelled()` a chance to short-circuit. Callers must still
+ * re-check cancellation after awaiting because the sleep is best-effort.
+ * @param {number} ms
+ * @param {() => boolean} isCancelled
+ */
+async function sleepCancellable(ms, isCancelled) {
+    if (ms <= 0) return;
+    let remaining = ms;
+    while (remaining > 0) {
+        if (isCancelled && isCancelled()) return;
+        const chunk = Math.min(CANCEL_POLL_MS, remaining);
+        await new Promise((resolve) => setTimeout(resolve, chunk));
+        remaining -= chunk;
+    }
+}
+
+/**
+ * Pull the `pathname` out of an http(s) URL so callers can test extensions
+ * against `.png` etc. without confusing query strings or fragments. Falls
+ * back to a manual strip when `new URL()` can't parse (e.g. non-standard
+ * hosts). Returns the input verbatim on unrecoverable parse failure so an
+ * extension check on the result will simply reject the URL.
+ * @param {string} url
+ * @returns {string}
+ */
+function urlPathnameFor(url) {
+    try {
+        return new URL(url).pathname;
+    } catch (_) {
+        return url.split("#")[0].split("?")[0];
+    }
+}
+
+/**
+ * Fetch an external image over the network with a bounded retry budget. Each
+ * attempt uses Obsidian's `requestUrl` (which bypasses the renderer's CORS
+ * enforcement) with `throw: false`, so we can inspect non-2xx statuses without
+ * a try/catch. Between failed attempts we wait a short linear backoff so a
+ * flaky server or transient DNS blip doesn't burn the whole retry budget in
+ * milliseconds.
+ *
+ * Cancellation: `isCancelled()` is polled before every network call, after
+ * each response, and inside the sleep between attempts. On a positive result
+ * the function returns `null` immediately so the caller can propagate the
+ * cancelled result upward.
+ *
+ * @param {string} url — Raw https URL, NOT decodeURIComponent'd (percent-
+ *     escaped bytes in the path must survive verbatim into the request).
+ * @param {() => boolean} isCancelled
+ * @param {number} backoffMs — Delay between attempts × attempt-number. Tests
+ *     pass 0 to keep retry tests instantaneous.
+ * @returns {Promise<Uint8Array | null>} Bytes on success; `null` on cancel.
+ * @throws Error containing the final HTTP status or network error message
+ *     when all attempts fail without cancellation.
+ */
+async function fetchExternalImageBytes(url, isCancelled, backoffMs) {
+    const cancel = isCancelled || (() => false);
+    let lastError = null;
+    for (let attempt = 1; attempt <= EXTERNAL_FETCH_MAX_ATTEMPTS; attempt++) {
+        if (cancel()) return null;
+        let response = null;
+        try {
+            response = await requestUrl({ url, method: "GET", throw: false });
+        } catch (err) {
+            lastError = err instanceof Error ? err : new Error(String(err));
+            response = null;
+        }
+        if (cancel()) return null;
+        if (response
+            && Number.isFinite(response.status)
+            && response.status >= 200
+            && response.status < 300
+            && response.arrayBuffer
+            && response.arrayBuffer.byteLength > 0) {
+            return new Uint8Array(response.arrayBuffer);
+        }
+        if (response) {
+            const status = Number.isFinite(response.status) ? response.status : "?";
+            const emptyBody = response.status >= 200
+                && response.status < 300
+                && (!response.arrayBuffer || response.arrayBuffer.byteLength === 0);
+            lastError = emptyBody
+                ? new Error("empty response body")
+                : new Error(`HTTP ${status}`);
+        }
+        if (attempt < EXTERNAL_FETCH_MAX_ATTEMPTS) {
+            const wait = (backoffMs !== undefined ? backoffMs : EXTERNAL_FETCH_BACKOFF_MS)
+                * attempt;
+            await sleepCancellable(wait, cancel);
+            if (cancel()) return null;
+        }
+    }
+    throw lastError || new Error("external image fetch failed");
 }
 
 /** Decode a cached embed link into a vault linkpath (best effort). */
@@ -219,6 +378,103 @@ function collectImageReferences(content, embeds) {
 }
 
 /**
+ * Discover standard-form external image references (`![alt](https?://…)`) by
+ * scanning only body-level sections that Obsidian's parser marks as scannable.
+ * External images do NOT appear in `metadataCache.embeds` or `.links`, so we
+ * can't reuse the embed-cache path here; but we still refuse to scan the raw
+ * content string because frontmatter, fenced code, comments, and raw HTML all
+ * commonly contain literal `![alt](…)` strings that mustn't be rewritten.
+ *
+ * Inline backtick spans inside a paragraph are masked out with equal-length
+ * spaces so match offsets stay aligned with the original slice — Markdown
+ * documentation like `` `![alt](https://…)` `` should never be edited.
+ *
+ * @param {string} content
+ * @param {import("obsidian").SectionCache[] | undefined} sections
+ * @returns {Array<{
+ *   kind: "standard",
+ *   external: true,
+ *   start: number,
+ *   end: number,
+ *   original: string,
+ *   alt: string,
+ *   altEnd: number,
+ *   link: string,
+ * }>}
+ */
+function collectExternalImageReferences(content, sections) {
+    if (!Array.isArray(sections)) return [];
+    const edits = [];
+    for (const section of sections) {
+        const type = section && section.type;
+        if (!SAFE_SECTION_TYPES.has(type)) continue;
+        const position = section && section.position;
+        const start = position && position.start && position.start.offset;
+        const end = position && position.end && position.end.offset;
+        if (!Number.isInteger(start) || !Number.isInteger(end)
+            || start < 0 || end <= start || end > content.length) {
+            continue;
+        }
+        const slice = content.slice(start, end);
+        // Mask inline-code spans with equal-length spaces so match offsets
+        // still line up with `slice` (and therefore with `content` once we
+        // add `start`).
+        const masked = slice.replace(INLINE_CODE_SPAN_RE, (m) => " ".repeat(m.length));
+        // matchAll is safe: EXTERNAL_STANDARD_IMAGE_RE has the /g flag.
+        for (const match of masked.matchAll(EXTERNAL_STANDARD_IMAGE_RE)) {
+            const matchStart = start + match.index;
+            const matchEnd = matchStart + match[0].length;
+            // Recover the ACTUAL text at those offsets from the unmasked
+            // content — the masking step only affects search boundaries,
+            // not the string we ultimately splice back in.
+            const original = content.slice(matchStart, matchEnd);
+            if (original !== match[0]) continue;
+            const altEnd = findStandardAltEnd(original);
+            if (altEnd === -1) continue;
+            edits.push({
+                kind: "standard",
+                external: true,
+                start: matchStart,
+                end: matchEnd,
+                original,
+                alt: original.slice(2, altEnd),
+                altEnd,
+                link: match[2],
+            });
+        }
+    }
+    return edits;
+}
+
+/**
+ * Merge parser-confirmed local edits with section-scanned external edits into
+ * a single, sorted, non-overlapping list ordered by descending `start` so the
+ * caller can splice edits from the end without invalidating earlier offsets.
+ *
+ * @param {string} content
+ * @param {import("obsidian").EmbedCache[] | undefined} embeds
+ * @param {import("obsidian").SectionCache[] | undefined} sections
+ */
+function collectAllImageReferences(content, embeds, sections) {
+    const localEdits = collectImageReferences(content, embeds);
+    const externalEdits = collectExternalImageReferences(content, sections);
+    if (externalEdits.length === 0) return localEdits;
+    const merged = localEdits.concat(externalEdits);
+    // Sort DESC by start so the splice loop can walk from the end.
+    merged.sort((a, b) => b.start - a.start);
+    // Guard against overlapping ranges (never expected between the two
+    // sources, but a stale cache or racing parser could produce them).
+    const nonOverlapping = [];
+    let nextStart = content.length;
+    for (const edit of merged) {
+        if (edit.end > nextStart) continue;
+        nonOverlapping.push(edit);
+        nextStart = edit.start;
+    }
+    return nonOverlapping;
+}
+
+/**
  * Encapsulates the "resize images in a note's Markdown syntax" job.
  * The image files themselves are never modified.
  */
@@ -231,6 +487,10 @@ class ResizeImagesJob {
         this.app = plugin.app;
         this.imageTextHeightDetector = new ImageTextHeightDetector(plugin);
         this._cancelGeneration = 0;
+        // Backoff between external-image retry attempts. Exposed as a
+        // per-instance field so tests can set it to 0 without hard-coding
+        // that fast path into the production retry helper.
+        this._externalFetchBackoffMs = EXTERNAL_FETCH_BACKOFF_MS;
     }
 
     /**
@@ -308,6 +568,7 @@ class ResizeImagesJob {
         if (this._isCancelled(token)) return this._cancelledResult({});
         const cache = this.app.metadataCache.getFileCache(view.file);
         const embeds = cache && cache.embeds;
+        const sections = cache && cache.sections;
         const {
             newContent,
             resized,
@@ -315,7 +576,9 @@ class ResizeImagesJob {
             considered,
             aborted: rewriteAborted,
             cancelled: rewriteCancelled,
-        } = await this.rewriteContent(original, view.file.path, bodyFontPx, embeds, token);
+        } = await this.rewriteContent(
+            original, view.file.path, bodyFontPx, embeds, sections, token,
+        );
 
         if (rewriteAborted || rewriteCancelled || this._isCancelled(token)) {
             return this._cancelledResult({ considered, resized, skipped });
@@ -364,17 +627,38 @@ class ResizeImagesJob {
     }
 
     /**
-     * Build source edits from parser-confirmed embed positions, resolving and
-     * measuring each image through the vault before returning rewritten content
-     * plus counters. Public so it can be unit-tested independently of a view.
+     * Build source edits from parser-confirmed embed positions plus
+     * section-scanned external references, resolving and measuring each
+     * image (locally from the vault or by downloading over the network for
+     * https URLs) before returning rewritten content plus counters. Public
+     * so it can be unit-tested independently of a view.
+     *
+     * External URLs live outside `metadataCache.embeds`, so `sections`
+     * (from `CachedMetadata.sections`) is what constrains external
+     * discovery to safe body regions — see EXTERNAL_IMAGES_NOTES.md.
      *
      * @param {string} content
      * @param {string} sourcePath
      * @param {number} bodyFontPx
      * @param {import("obsidian").EmbedCache[] | undefined} embeds
+     * @param {import("obsidian").SectionCache[] | undefined} [sections]
+     *     Undefined at legacy 4-arg call sites; external discovery
+     *     safely no-ops when absent (never falls back to scanning
+     *     the raw content string).
+     * @param {object} [token]
      */
-    async rewriteContent(content, sourcePath, bodyFontPx, embeds, token) {
-        const edits = collectImageReferences(content, embeds);
+    async rewriteContent(content, sourcePath, bodyFontPx, embeds, sections, token) {
+        // Backward-compat: legacy 4-arg / 5-arg-with-token call sites
+        // (existing unit tests) passed `token` in the `sections` position.
+        // Detect and shift it back so those calls keep working.
+        if (token === undefined && sections !== undefined
+            && !Array.isArray(sections)
+            && typeof sections === "object"
+            && ("jobGeneration" in sections || "pluginGeneration" in sections)) {
+            token = sections;
+            sections = undefined;
+        }
+        const edits = collectAllImageReferences(content, embeds, sections);
         let result = content;
         let resized = 0;
         let skipped = 0;
@@ -400,32 +684,112 @@ class ResizeImagesJob {
                     cancelled: true,
                 };
             }
-            const rawLinkpath = urlToLinkpath(edit.link);
-            if (!rawLinkpath || EXTERNAL_URL_RE.test(rawLinkpath)) continue;
-            if (!IMAGE_EXT_RE.test(rawLinkpath)) continue;
+            const isExternal = Boolean(edit.external);
 
-            considered += 1;
+            // -------- Resolve to {resourcePath | bytes, dims} --------
+            let tfile = null;
+            let resourcePath = null;
+            let externalBytes = null;
+            let dims = null;
+            let rawLinkpath = "";
 
-            // Formats outside tesseract.js's decoder set (gif/svg/avif/tiff)
-            // count as considered-but-skipped rather than causing the batch
-            // to blow up when the worker rejects the bytes.
-            if (!OCR_SUPPORTED_EXT_RE.test(rawLinkpath)) { skipped += 1; continue; }
-
-            const tfile = this.app.metadataCache.getFirstLinkpathDest(rawLinkpath, sourcePath);
-            if (!tfile) { skipped += 1; continue; }
-
-            const resourcePath = this.app.vault.getResourcePath(tfile);
-            const dims = await loadImageDimensions(resourcePath);
-            if (!dims || !dims.naturalWidth) { skipped += 1; continue; }
-            if (this._isCancelled(token)) {
-                return {
-                    newContent: result,
-                    resized,
-                    skipped,
-                    considered,
-                    aborted: true,
-                    cancelled: true,
-                };
+            if (isExternal) {
+                // Preserve the URL verbatim so percent-encoded bytes reach
+                // the server unchanged. Do NOT decodeURIComponent here.
+                const fetchUrl = String(edit.link).trim();
+                rawLinkpath = fetchUrl;
+                const pathForExt = urlPathnameFor(fetchUrl);
+                if (!IMAGE_EXT_RE.test(pathForExt)) continue;
+                considered += 1;
+                if (!OCR_SUPPORTED_EXT_RE.test(pathForExt)) {
+                    skipped += 1;
+                    continue;
+                }
+                let bytes;
+                try {
+                    bytes = await fetchExternalImageBytes(
+                        fetchUrl,
+                        () => this._isCancelled(token),
+                        this._externalFetchBackoffMs,
+                    );
+                } catch (err) {
+                    if (this._isCancelled(token)) {
+                        return {
+                            newContent: result,
+                            resized,
+                            skipped,
+                            considered,
+                            aborted: true,
+                            cancelled: true,
+                        };
+                    }
+                    console.error(
+                        "resize-pics: failed to fetch external image",
+                        fetchUrl, err,
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                if (this._isCancelled(token)) {
+                    return {
+                        newContent: result,
+                        resized,
+                        skipped,
+                        considered,
+                        aborted: true,
+                        cancelled: true,
+                    };
+                }
+                if (bytes === null) {
+                    // fetchExternalImageBytes returns null only on cancel.
+                    return {
+                        newContent: result,
+                        resized,
+                        skipped,
+                        considered,
+                        aborted: true,
+                        cancelled: true,
+                    };
+                }
+                dims = await loadImageDimensionsFromBytes(bytes);
+                if (this._isCancelled(token)) {
+                    return {
+                        newContent: result,
+                        resized,
+                        skipped,
+                        considered,
+                        aborted: true,
+                        cancelled: true,
+                    };
+                }
+                if (!dims || !dims.naturalWidth) { skipped += 1; continue; }
+                externalBytes = bytes;
+            } else {
+                rawLinkpath = urlToLinkpath(edit.link);
+                // Local branch: unresolved link or other-scheme URI (file://,
+                // app://, data:, …) is silently skipped, not counted.
+                if (!rawLinkpath || EXTERNAL_URL_RE.test(rawLinkpath)) continue;
+                if (!IMAGE_EXT_RE.test(rawLinkpath)) continue;
+                considered += 1;
+                if (!OCR_SUPPORTED_EXT_RE.test(rawLinkpath)) {
+                    skipped += 1;
+                    continue;
+                }
+                tfile = this.app.metadataCache.getFirstLinkpathDest(rawLinkpath, sourcePath);
+                if (!tfile) { skipped += 1; continue; }
+                resourcePath = this.app.vault.getResourcePath(tfile);
+                dims = await loadImageDimensions(resourcePath);
+                if (!dims || !dims.naturalWidth) { skipped += 1; continue; }
+                if (this._isCancelled(token)) {
+                    return {
+                        newContent: result,
+                        resized,
+                        skipped,
+                        considered,
+                        aborted: true,
+                        cancelled: true,
+                    };
+                }
             }
 
             // Bring the OCR worker up on the first image that would
@@ -470,6 +834,11 @@ class ResizeImagesJob {
                 imageTextHeightPx = await this.imageTextHeightDetector.detect({
                     tfile,
                     resourcePath,
+                    // Pre-fetched bytes for external images; detect() will
+                    // ship these into the worker instead of re-fetching.
+                    // For local images this is null and OCR falls back to
+                    // its main-thread fetch(resourcePath) path.
+                    bytes: externalBytes,
                     naturalWidth: dims.naturalWidth,
                     naturalHeight: dims.naturalHeight,
                 });
