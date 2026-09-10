@@ -13,7 +13,7 @@ const {
 } = require("./settings");
 const { ResizeImagesJob } = require("./resize");
 
-const PLUGIN_VERSION = "0.2.0";
+const PLUGIN_VERSION = "0.2.1";
 const RESIZE_COMMAND_ID = "resize-pics-to-font-size";
 const RIBBON_ICON_ID = "image-upscale";
 const NOTICE_DURATION_MS = 4000;

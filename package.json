@@ -1,6 +1,6 @@
 {
   "name": "resize-pics",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Rescale images in a note so that text baked into them matches the body font size.",
   "scripts": {
