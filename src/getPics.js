@@ -51,19 +51,31 @@ const EXTERNAL_HTTPS_RE = /^https?:\/\//i;
 // "safely skip on doubt": external images in the wild almost never contain those.
 const EXTERNAL_STANDARD_IMAGE_RE = /!\[([^\]\n]*)\]\((https?:\/\/[^\s()]+)(?:\s+"[^"]*")?\)/gi;
 
-// SectionCache.type values that can legitimately contain body-level Markdown
-// image syntax. Everything else (`yaml`, `code`, `html`, `comment`, `heading`,
-// `thematicBreak`, …) is out of scope — scanning them would false-positive on
-// literal `![alt](...)` strings inside frontmatter, fenced code, or comments.
-// See EXTERNAL_IMAGES_NOTES.md:57-73.
-const SAFE_SECTION_TYPES = new Set(["paragraph", "list", "blockquote", "callout"]);
-
 // SectionCache.type for a Markdown table. Inside a table cell `|` is the column
 // delimiter, so Obsidian's size syntax has to be written escaped
 // (`![[img.png\|800]]`); emitting a raw pipe there splits the cell and destroys
 // the table. Every edit is therefore tagged with whether it sits inside a table
 // section, and src/resize.js picks its separator accordingly.
 const TABLE_SECTION_TYPE = "table";
+
+// SectionCache.type values that can legitimately contain body-level Markdown
+// image syntax. Everything else (`yaml`, `code`, `html`, `comment`, `heading`,
+// `thematicBreak`, …) is out of scope — scanning them would false-positive on
+// literal `![alt](...)` strings inside frontmatter, fenced code, or comments.
+// See EXTERNAL_IMAGES_NOTES.md:57-73.
+//
+// `table` belongs here for the same reason `paragraph` does: a cell is ordinary
+// inline Markdown and routinely holds `![alt](https://…)`. It was excluded
+// while the rewriter could only emit a raw `|`, because discovering those
+// images would have meant destroying the table on the very next write. Now
+// that every edit carries `inTable` and the separator is escaped accordingly,
+// scanning tables is safe — and leaving them out only meant external images in
+// tables were silently never resized. Local (vault) images never depended on
+// this set at all: they come from `metadataCache.embeds`, which is not filtered
+// by section type, so they were always found inside tables.
+const SAFE_SECTION_TYPES = new Set([
+    "paragraph", "list", "blockquote", "callout", TABLE_SECTION_TYPE,
+]);
 
 // Inline `` `…` `` spans inside a paragraph must NOT be scanned — a code
 // example like `` `![](https://real-url/x.png)` `` would otherwise be picked
@@ -279,6 +291,15 @@ function collectImageReferences(content, embeds) {
  * Inline backtick spans inside a paragraph are masked out with equal-length
  * spaces so match offsets stay aligned with the original slice — Markdown
  * documentation like `` `![alt](https://…)` `` should never be edited.
+ *
+ * Table sections are scanned like any other body section. A cell's contents are
+ * ordinary inline Markdown, and the two constructs that make raw-content
+ * scanning unsafe cannot occur there: a fenced block can't live in a cell, and
+ * an inline span is masked by the same pass as everywhere else. The caller tags
+ * the resulting edits with `inTable` so the rewriter escapes the size
+ * separator. Note that a table nested in a callout or blockquote may be covered
+ * by both sections, producing the same match twice — the caller's overlap
+ * filter collapses those duplicates.
  *
  * @param {string} content
  * @param {import("obsidian").SectionCache[] | undefined} sections

@@ -182,7 +182,7 @@ resize-pics/
 │   ├── getPics.js             # Image discovery + fetching (no OCR / no rewrite)
 │   │                          #   · IMAGE_EXT_RE / OCR_SUPPORTED_EXT_RE
 │   │                          #   · EXTERNAL_URL_RE / EXTERNAL_HTTPS_RE
-│   │                          #   · SAFE_SECTION_TYPES = {paragraph, list, blockquote, callout}
+│   │                          #   · SAFE_SECTION_TYPES = {paragraph, list, blockquote, callout, table}
 │   │                          #   · EXTERNAL_FETCH_MAX_ATTEMPTS=3, BACKOFF_MS=200
 │   │                          #   · collectImageReferences         (embeds → edit list)
 │   │                          #   · collectExternalImageReferences (sections → edit list)
@@ -244,7 +244,7 @@ resize-pics/
 
 - **Desktop only** (`isDesktopOnly: true`): the tesseract.js worker + WASM depends on desktop Electron
 - **OCR-supported formats**: `png`, `jpg` / `jpeg`, `webp`, `bmp`. Formats Obsidian recognizes as images but tesseract can't decode (`gif`, `svg`, `avif`, `tiff`) are counted as "considered but skipped"
-- **External images are downloaded, verified in `cache.sections`, retried up to 3× per image**: `![alt](https://…/x.png)` doesn't appear in Obsidian's `metadataCache.embeds`, so the plugin scans body-level `cache.sections` (`paragraph`, `list`, `blockquote`, `callout`) for the syntax, then downloads via `requestUrl` (Obsidian's CORS-immune HTTP client) and runs the same OCR + size-formula path as local images. Non-`http(s)` URIs (`file://`, `app://`, `data:`) are still skipped
+- **External images are downloaded, verified in `cache.sections`, retried up to 3× per image**: `![alt](https://…/x.png)` doesn't appear in Obsidian's `metadataCache.embeds`, so the plugin scans body-level `cache.sections` (`paragraph`, `list`, `blockquote`, `callout`, `table`) for the syntax, then downloads via `requestUrl` (Obsidian's CORS-immune HTTP client) and runs the same OCR + size-formula path as local images. Non-`http(s)` URIs (`file://`, `app://`, `data:`) are still skipped. `table` is on that list because a cell is ordinary inline Markdown: the constructs that make raw-content scanning unsafe (fenced blocks, frontmatter) cannot appear in one, and inline backtick spans are masked by the same pass used everywhere else. A table nested in a callout can be covered by both sections and therefore matched twice; the overlap filter that merges the local and external edit lists collapses those duplicates
 - **Scale clamp**: the `bodyFontPx / imageTextHeightPx` ratio is clamped to `[1/10, 10]`; images outside that range are treated as "extreme text-height outliers" (usually a 1-px noise pixel misrecognized as text) and skipped
 - **≥ 2 usable lines required**: a single line is too small a sample and can be pulled around by a misrecognized line; images with fewer usable lines are skipped
 - **Minimum line confidence = 60**: any line below this confidence is dropped; dashed borders, JPEG blocking artefacts, and single-pixel dust are frequently seen as 1-px-tall "text" by tesseract

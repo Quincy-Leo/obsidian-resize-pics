@@ -277,6 +277,76 @@ test("collectReferences: table section 位置非法 → 不当成表格（safe f
 });
 
 // ---------------------------------------------------------------------------
+// collectReferences —— table section 内的外链
+// ---------------------------------------------------------------------------
+//
+// 外链图不进 metadataCache.embeds，只能靠 section 扫描发现，而 table 一度不在
+// 白名单里 —— 于是表格里的 `![alt](https://…)` 从来不会被发现（静默不处理）。
+// 单元格内容就是普通 inline Markdown，且不可能出现围栏代码块，反引号 span 又
+// 由既有的 masking 处理，所以扫描是安全的。
+
+test("collectReferences: table section 内的 https 外链会被扫到并标记 inTable", () => {
+    const table = "| a | b |\n| - | - |\n| x | ![alt](https://ex.com/in.png) |";
+    const edits = new PicSource({}, {}).collectReferences(
+        table, undefined, sectionsWithTable(table, table),
+    );
+    assert.equal(edits.length, 1);
+    assert.equal(edits[0].kind, "standard");
+    assert.equal(edits[0].external, true);
+    assert.equal(edits[0].link, "https://ex.com/in.png");
+    assert.equal(edits[0].alt, "alt");
+    assert.equal(edits[0].inTable, true);
+});
+
+test("collectReferences: 同一行多个单元格各自的外链都被扫到", () => {
+    const table = "| a | b |\n| - | - |\n| ![](https://ex.com/1.png) | ![](https://ex.com/2.png) |";
+    const edits = new PicSource({}, {}).collectReferences(
+        table, undefined, sectionsWithTable(table, table),
+    );
+    // splice 从末尾往前 ⇒ start 更大的 2.png 在前。
+    assert.deepEqual(edits.map((e) => e.link), [
+        "https://ex.com/2.png",
+        "https://ex.com/1.png",
+    ]);
+    assert.deepEqual(edits.map((e) => e.inTable), [true, true]);
+});
+
+test("collectReferences: 表格内已转义的 size 不影响 alt 切分", () => {
+    // `\|` 在单元格里是转义竖线；alt 组 [^\]\n]* 照常匹配，altEnd 也要落对。
+    const table = "| x | ![alt\\|300](https://ex.com/a.png) |";
+    const edits = new PicSource({}, {}).collectReferences(
+        table, undefined, sectionsWithTable(table, table),
+    );
+    assert.equal(edits.length, 1);
+    assert.equal(edits[0].alt, "alt\\|300");
+    assert.equal(edits[0].link, "https://ex.com/a.png");
+});
+
+test("collectReferences: 表格单元格里的反引号 span 仍被屏蔽", () => {
+    const table = "| 语法 | 真图 |\n| - | - |\n"
+        + "| `![](https://ex.com/x.png)` | ![](https://ex.com/y.png) |";
+    const edits = new PicSource({}, {}).collectReferences(
+        table, undefined, sectionsWithTable(table, table),
+    );
+    assert.equal(edits.length, 1);
+    assert.equal(edits[0].link, "https://ex.com/y.png");
+});
+
+test("collectReferences: callout 与 table section 重叠 → 同一外链只保留一条", () => {
+    // callout / blockquote 里嵌表格时，两个 section 可能覆盖同一段文本，
+    // 扫描会命中两次；重叠过滤必须把重复项收掉，否则会 splice 两次。
+    const table = "| x | ![](https://ex.com/a.png) |";
+    const sections = [
+        { type: "callout", position: { start: { offset: 0 }, end: { offset: table.length } } },
+        { type: "table", position: { start: { offset: 0 }, end: { offset: table.length } } },
+    ];
+    const edits = new PicSource({}, {}).collectReferences(table, undefined, sections);
+    assert.equal(edits.length, 1);
+    assert.equal(edits[0].link, "https://ex.com/a.png");
+    assert.equal(edits[0].inTable, true);
+});
+
+// ---------------------------------------------------------------------------
 // resolve —— 本地分支
 // ---------------------------------------------------------------------------
 

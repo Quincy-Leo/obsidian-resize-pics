@@ -323,6 +323,91 @@ test("sections 缺失时退回裸竖线（不猜测表格，保持既有行为�
 });
 
 // ---------------------------------------------------------------------------
+// 表格内的外链图：能被发现，且同样转义
+// ---------------------------------------------------------------------------
+//
+// 外链图不进 metadataCache.embeds，只能靠 section 扫描；table 一度不在扫描白
+// 名单里，表格里的 `![alt](https://…)` 因此从来不会被 resize（静默不处理）。
+// 这里走 rewriteContent 全链路：发现 → 下载 → OCR → 转义回写。
+
+test("表格内的外链图被发现并 resize，竖线转义", async () => {
+    const { job } = makeJob({ detectFn: () => 8 }); // scale=2 ⇒ 400×2=800
+    stubRequestUrlOk();
+    const table = `${TABLE_HEAD}| text | ![alt](https://ex.com/a.png) |`;
+    const res = await job.rewriteContent(
+        table, "note.md", 16, [], sectionsWithTable(table, table),
+    );
+    assert.equal(res.considered, 1);
+    assert.equal(res.resized, 1);
+    assert.equal(
+        res.newContent,
+        `${TABLE_HEAD}| text | ![alt\\|800](https://ex.com/a.png) |`,
+    );
+});
+
+test("表格内的外链图空 alt：size 填进 alt，不产生竖线", async () => {
+    const { job } = makeJob({ detectFn: () => 16 });
+    stubRequestUrlOk();
+    const table = `${TABLE_HEAD}| text | ![](https://ex.com/a.png) |`;
+    const res = await job.rewriteContent(
+        table, "note.md", 16, [], sectionsWithTable(table, table),
+    );
+    assert.equal(res.resized, 1);
+    assert.equal(
+        res.newContent,
+        `${TABLE_HEAD}| text | ![400](https://ex.com/a.png) |`,
+    );
+});
+
+test("表格内的外链图二次运行幂等：反斜杠不累积", async () => {
+    const { job } = makeJob({ detectFn: () => 16 });
+    stubRequestUrlOk();
+    const table = `${TABLE_HEAD}| text | ![alt\\|123](https://ex.com/a.png) |`;
+    const res = await job.rewriteContent(
+        table, "note.md", 16, [], sectionsWithTable(table, table),
+    );
+    assert.equal(
+        res.newContent,
+        `${TABLE_HEAD}| text | ![alt\\|400](https://ex.com/a.png) |`,
+    );
+});
+
+test("外链图：表格内转义、表格外保持裸竖线", async () => {
+    const { job } = makeJob({ detectFn: () => 16 });
+    stubRequestUrlOk();
+    const table = `${TABLE_HEAD}| text | ![in](https://ex.com/in.png) |`;
+    const tail = "正文 ![out](https://ex.com/out.png) 结束";
+    const src = `${table}\n\n${tail}`;
+    const res = await job.rewriteContent(
+        src, "note.md", 16, [], sectionsWithTable(src, table, [tail]),
+    );
+    assert.equal(res.resized, 2);
+    assert.equal(
+        res.newContent,
+        `${TABLE_HEAD}| text | ![in\\|400](https://ex.com/in.png) |`
+            + "\n\n正文 ![out|400](https://ex.com/out.png) 结束",
+    );
+});
+
+test("表格内本地图 + 外链图混排：两种都转义", async () => {
+    const { job } = makeJob({ detectFn: () => 16 });
+    stubRequestUrlOk();
+    const table = `${TABLE_HEAD}| ![[local.png]] | ![ext](https://ex.com/e.png) |`;
+    const res = await job.rewriteContent(
+        table,
+        "note.md",
+        16,
+        makeEmbedCache(table, [["![[local.png]]", "local.png"]]),
+        sectionsWithTable(table, table),
+    );
+    assert.equal(res.resized, 2);
+    assert.equal(
+        res.newContent,
+        `${TABLE_HEAD}| ![[local.png\\|400]] | ![ext\\|400](https://ex.com/e.png) |`,
+    );
+});
+
+// ---------------------------------------------------------------------------
 // ResizeImagesJob 的记账：PicSource 结果 → considered/skipped/resized
 // ---------------------------------------------------------------------------
 //

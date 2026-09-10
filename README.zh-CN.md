@@ -180,7 +180,7 @@ resize-pics/
 │   ├── getPics.js             # 图片发现 + 拉取字节（不含 OCR / 不含改写）
 │   │                          #   · IMAGE_EXT_RE / OCR_SUPPORTED_EXT_RE
 │   │                          #   · EXTERNAL_URL_RE / EXTERNAL_HTTPS_RE
-│   │                          #   · SAFE_SECTION_TYPES = {paragraph, list, blockquote, callout}
+│   │                          #   · SAFE_SECTION_TYPES = {paragraph, list, blockquote, callout, table}
 │   │                          #   · EXTERNAL_FETCH_MAX_ATTEMPTS=3、BACKOFF_MS=200
 │   │                          #   · collectImageReferences         (embeds → 编辑列表)
 │   │                          #   · collectExternalImageReferences (sections → 编辑列表)
@@ -242,7 +242,7 @@ resize-pics/
 
 - **仅桌面端**（`isDesktopOnly: true`）：tesseract.js worker + WASM 依赖桌面 Electron 环境
 - **可 OCR 的格式**：`png`、`jpg` / `jpeg`、`webp`、`bmp`。文档里被 Obsidian 认为是图片但 tesseract 无法解码的格式（`gif`、`svg`、`avif`、`tiff`）会被计入"考虑过但跳过"
-- **外链图片按需下载识别**：`![alt](https://…/x.png)` 不在 Obsidian 的 `metadataCache.embeds` 里，插件通过扫描 `cache.sections` 中的正文段落（`paragraph`/`list`/`blockquote`/`callout`）识别外链，再用 `requestUrl`（Obsidian 内置的 CORS 免疫 HTTP 客户端）下载，每张图最多重试 3 次，随后走与本地图完全相同的 OCR + 缩放公式；`file://` / `app://` / `data:` 等非 http(s) URI 仍然跳过
+- **外链图片按需下载识别**：`![alt](https://…/x.png)` 不在 Obsidian 的 `metadataCache.embeds` 里，插件通过扫描 `cache.sections` 中的正文段落（`paragraph`/`list`/`blockquote`/`callout`/`table`）识别外链，再用 `requestUrl`（Obsidian 内置的 CORS 免疫 HTTP 客户端）下载，每张图最多重试 3 次，随后走与本地图完全相同的 OCR + 缩放公式；`file://` / `app://` / `data:` 等非 http(s) URI 仍然跳过。`table` 在白名单里，是因为单元格内容就是普通 inline Markdown：让全文扫描不安全的那些结构（围栏代码块、frontmatter）不可能出现在单元格里，反引号 span 又由与别处相同的 masking 处理。callout 里嵌表格时两个 section 可能覆盖同一段文本、同一处被命中两次，本地与外链编辑列表合并时的重叠过滤会把重复项收掉
 - **规模钳制**：`bodyFontPx / imageTextHeightPx` 的比例被限制在 `[1/10, 10]` 之间；超出这个范围的图片被识别为"文字高度极端异常"（多半是 OCR 误识 1px 噪点），跳过
 - **要求 ≥ 2 行有效文本**：单行文本样本量太小，容易被误识别的行拉偏均值；少于 2 行的图片跳过
 - **锚点检测最少置信度 = 60**：单行低于此置信度会被丢弃；虚线边框、JPEG 分块伪影、单像素点很容易被 tesseract 当作 1-px 高的"文字"
