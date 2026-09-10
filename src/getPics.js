@@ -58,6 +58,13 @@ const EXTERNAL_STANDARD_IMAGE_RE = /!\[([^\]\n]*)\]\((https?:\/\/[^\s()]+)(?:\s+
 // See EXTERNAL_IMAGES_NOTES.md:57-73.
 const SAFE_SECTION_TYPES = new Set(["paragraph", "list", "blockquote", "callout"]);
 
+// SectionCache.type for a Markdown table. Inside a table cell `|` is the column
+// delimiter, so Obsidian's size syntax has to be written escaped
+// (`![[img.png\|800]]`); emitting a raw pipe there splits the cell and destroys
+// the table. Every edit is therefore tagged with whether it sits inside a table
+// section, and src/resize.js picks its separator accordingly.
+const TABLE_SECTION_TYPE = "table";
+
 // Inline `` `…` `` spans inside a paragraph must NOT be scanned — a code
 // example like `` `![](https://real-url/x.png)` `` would otherwise be picked
 // up. We mask them out with equal-length spaces so match offsets stay aligned
@@ -331,14 +338,58 @@ function collectExternalImageReferences(content, sections) {
 }
 
 /**
- * Merge parser-confirmed local edits with section-scanned external edits into
- * a single, sorted, non-overlapping list ordered by descending `start` so the
- * caller can splice edits from the end without invalidating earlier offsets.
+ * Collect the `[start, end)` offset range of every table section so edits can
+ * be tested for table membership.
  *
- * @param {string} content
- * @param {import("obsidian").EmbedCache[] | undefined} embeds
+ * The parser is the only reliable authority here: a "does this line start with
+ * `|`?" heuristic both false-negatives (Obsidian renders tables whose leading
+ * and trailing pipes are omitted) and false-positives (a paragraph line may
+ * legitimately begin with a pipe). Sections with malformed positions are
+ * dropped rather than guessed at — the edit is then treated as not-in-a-table,
+ * which is exactly the behaviour that predates this tagging.
+ *
  * @param {import("obsidian").SectionCache[] | undefined} sections
+ * @returns {Array<[number, number]>}
  */
+function collectTableRanges(sections) {
+    if (!Array.isArray(sections)) return [];
+    const ranges = [];
+    for (const section of sections) {
+        if (!section || section.type !== TABLE_SECTION_TYPE) continue;
+        const position = section.position;
+        const start = position && position.start && position.start.offset;
+        const end = position && position.end && position.end.offset;
+        if (!Number.isInteger(start) || !Number.isInteger(end) || end <= start) continue;
+        ranges.push([start, end]);
+    }
+    return ranges;
+}
+
+/** True when `[start, end)` is fully contained in one of `ranges`. */
+function isWithinRanges(ranges, start, end) {
+    for (const range of ranges) {
+        if (start >= range[0] && end <= range[1]) return true;
+    }
+    return false;
+}
+
+/**
+ * Sort DESC by `start` (so the splice loop can walk from the end) and drop
+ * overlapping ranges. Overlaps are never expected between the embed cache and
+ * the section scan, but a stale cache or racing parser could produce them and
+ * splicing those would corrupt source text.
+ */
+function mergeNonOverlapping(content, edits) {
+    edits.sort((a, b) => b.start - a.start);
+    const nonOverlapping = [];
+    let nextStart = content.length;
+    for (const edit of edits) {
+        if (edit.end > nextStart) continue;
+        nonOverlapping.push(edit);
+        nextStart = edit.start;
+    }
+    return nonOverlapping;
+}
 
 // ---------------------------------------------------------------------------
 // Fetching — one edit → bytes + dims, over vault or network
@@ -454,24 +505,24 @@ class PicSource {
      * metadata cache (`embeds`) or sits in a scannable section (`sections`).
      * Returns edit records ordered so the caller can splice them from the
      * end without invalidating earlier offsets.
+     *
+     * Every record carries `inTable`, telling the rewriter whether the size
+     * separator has to be emitted escaped. When `sections` is absent (legacy
+     * call sites) no table can be identified and `inTable` is `false` for
+     * everything — the same raw-pipe output as before this tagging existed.
      */
     collectReferences(content, embeds, sections) {
         const localEdits = collectImageReferences(content, embeds);
         const externalEdits = collectExternalImageReferences(content, sections);
-        if (externalEdits.length === 0) return localEdits;
-        const merged = localEdits.concat(externalEdits);
-        // Sort DESC by start so the splice loop can walk from the end.
-        merged.sort((a, b) => b.start - a.start);
-        // Guard against overlapping ranges (never expected between the two
-        // sources, but a stale cache or racing parser could produce them).
-        const nonOverlapping = [];
-        let nextStart = content.length;
-        for (const edit of merged) {
-            if (edit.end > nextStart) continue;
-            nonOverlapping.push(edit);
-            nextStart = edit.start;
+        const edits = externalEdits.length === 0
+            ? localEdits
+            : mergeNonOverlapping(content, localEdits.concat(externalEdits));
+
+        const tableRanges = collectTableRanges(sections);
+        for (const edit of edits) {
+            edit.inTable = isWithinRanges(tableRanges, edit.start, edit.end);
         }
-        return nonOverlapping;
+        return edits;
     }
 
     /**

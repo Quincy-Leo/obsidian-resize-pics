@@ -231,6 +231,7 @@ resize-pics/
 - **依赖资源整链校验**：所有 Tesseract 运行时文件在写入磁盘、以及每次 `checkStatus()` 时都会重新算 SHA-256 与 `REQUIRED_ASSETS` 中的常量比对；不匹配 → 从磁盘删除、报为失败，用户点下一次"下载"才会重试。跨版本/供应链投毒的老文件不会被静默使用
 - **IDB 命名空间**：tesseract.js 默认把 traineddata 写在共享的 `keyval-store/keyval`；本插件的键统一带 `resize-pics/` 前缀，清理时用游标 + `startsWith` 精确删除，不会误删其他插件的条目
 - **原子写入笔记**：使用 `Vault.process(file, updater)` 原子写入接口，让 Obsidian 底层做冲突检测；`current !== original` 时直接放弃写入并 Notice 用户"检测期间不要编辑文件，请重试"
+- **表格单元格内不写裸竖线**：Markdown 表格里 `|` 是列分隔符，size 段必须转义成 `![[img.png\|800]]` —— 裸竖线会把单元格切开、让该行列数超出表头，表格结构与图片引用会一起断裂。是否位于表格由 `cache.sections` 中 `type: "table"` 的范围判定，而不是"行首是不是 `|`"的启发式：后者会漏掉省略首尾竖线的表格，也会误判正文里以竖线开头的行。分段用 `/\\?\|/` 同时匹配裸竖线与转义竖线，把已转义的 size 先归一化再写回，否则二次运行会累积反斜杠（`a.png\` + `\|`）。`sections` 不可用时不猜测表格，保持原有的裸竖线输出
 - **`cacheMethod: "readOnly"`**：tesseract 内部 init 失败时会尝试 `del()` 掉传入的 traineddata IDB 键；只读模式关闭这个副作用，保住我们预填的字节
 - **同源限制的绕行**：Obsidian 主渲染器 `app://obsidian.md` 无法直接 `new Worker("app://<vault-uuid>/…")`；插件先用 `adapter.readBinary` 把 4 个二进制读进主线程内存，再用 `URL.createObjectURL` 包装 worker 和 core（Blob URL 继承创建者 origin），彻底绕过跨 origin 限制
 - **未加载 / 卸载防御**：`onunload` 会同步翻转 `__resizePicsUnloaded` 与 `_lifecycleGeneration`，所有异步任务在每个 await 点检查两者；即使晚返回也不会写入新的 Notice、按钮态或磁盘文件

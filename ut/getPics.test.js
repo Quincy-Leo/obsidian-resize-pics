@@ -218,6 +218,65 @@ test("collectReferences: 本地 + 外链混排 → 按 start 降序合并去重"
 });
 
 // ---------------------------------------------------------------------------
+// collectReferences —— inTable 标记
+// ---------------------------------------------------------------------------
+//
+// 表格单元格里 `|` 是列分隔符，size 段必须写成 `\|`。这里只验证「谁在表格
+// 里」这个判定；实际转义输出在 resize.test.js 覆盖。
+
+/** `table` section 覆盖 tableText，其余 paragraph section 各覆盖一段正文。 */
+function sectionsWithTable(content, tableText, paragraphTexts = []) {
+    const sectionFor = (type, text) => {
+        const start = content.indexOf(text);
+        assert.notEqual(start, -1, `section fixture not found in content: ${text}`);
+        return {
+            type,
+            position: {
+                start: { offset: start },
+                end: { offset: start + text.length },
+            },
+        };
+    };
+    return [sectionFor("table", tableText)]
+        .concat(paragraphTexts.map((text) => sectionFor("paragraph", text)));
+}
+
+test("collectReferences: table section 内的 embed 被标记 inTable，表格外为 false", () => {
+    const table = "| a | b |\n| - | - |\n| x | ![[in.png]] |";
+    const tail = "正文 ![[out.png]] 结束";
+    const src = `${table}\n\n${tail}`;
+    const edits = new PicSource({}, {}).collectReferences(
+        src,
+        makeEmbedCache(src, [["![[in.png]]", "in.png"], ["![[out.png]]", "out.png"]]),
+        sectionsWithTable(src, table, [tail]),
+    );
+    const byLink = new Map(edits.map((e) => [e.link, e]));
+    assert.equal(byLink.get("in.png").inTable, true);
+    assert.equal(byLink.get("out.png").inTable, false);
+});
+
+test("collectReferences: sections 缺失 → inTable 一律 false，不猜测表格", () => {
+    const src = "| x | ![[a.png]] |";
+    const edits = new PicSource({}, {}).collectReferences(
+        src, makeEmbedCache(src, [["![[a.png]]", "a.png"]]), undefined,
+    );
+    assert.equal(edits.length, 1);
+    assert.equal(edits[0].inTable, false);
+});
+
+test("collectReferences: table section 位置非法 → 不当成表格（safe fallback）", () => {
+    const src = "| x | ![[a.png]] |";
+    const malformed = [
+        { type: "table", position: { start: {}, end: { offset: src.length } } },
+        { type: "table", position: { start: { offset: 5 }, end: { offset: 5 } } },
+    ];
+    const edits = new PicSource({}, {}).collectReferences(
+        src, makeEmbedCache(src, [["![[a.png]]", "a.png"]]), malformed,
+    );
+    assert.equal(edits[0].inTable, false);
+});
+
+// ---------------------------------------------------------------------------
 // resolve —— 本地分支
 // ---------------------------------------------------------------------------
 

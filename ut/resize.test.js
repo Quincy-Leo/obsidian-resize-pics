@@ -92,6 +92,33 @@ function wholeParagraphSections(content) {
     }];
 }
 
+/** One `table` section covering `tableText`, plus optional paragraph sections. */
+function sectionsWithTable(content, tableText, paragraphTexts = []) {
+    const sectionFor = (type, text) => {
+        const start = content.indexOf(text);
+        assert.notEqual(start, -1, `section fixture not found in content: ${text}`);
+        return {
+            type,
+            position: {
+                start: { offset: start },
+                end: { offset: start + text.length },
+            },
+        };
+    };
+    return [sectionFor("table", tableText)]
+        .concat(paragraphTexts.map((text) => sectionFor("paragraph", text)));
+}
+
+function rewriteWithSections(job, content, references, sections, bodyFontPx = 16) {
+    return job.rewriteContent(
+        content,
+        "note.md",
+        bodyFontPx,
+        makeEmbedCache(content, references),
+        sections,
+    );
+}
+
 /** requestUrl stub returning a fixed 2xx body every call. */
 function stubRequestUrlOk() {
     const bytes = new Uint8Array([1, 2, 3, 4]).buffer;
@@ -203,6 +230,96 @@ test("splice 从末尾往前，早期 offset 保持有效", async () => {
     ]);
     assert.equal(res.newContent, "AAA ![[a.png|400]] BBB ![[b.png|400]] CCC");
     assert.equal(res.resized, 2);
+});
+
+// ---------------------------------------------------------------------------
+// 表格单元格内的回写：竖线必须转义
+// ---------------------------------------------------------------------------
+//
+// 表格里 `|` 是列分隔符，裸写 `![[a.png|800]]` 会把单元格切成两半、行的列数
+// 超出表头，图片引用就断了。Obsidian 要求写成 `![[a.png\|800]]`。
+// 判定依据是 CachedMetadata.sections 里 type==="table" 的 section 范围 ——
+// 不用「行首是不是 `|`」的启发式：省略首尾竖线的表格会漏判，而正文里以竖线
+// 开头的行会误判。
+
+const TABLE_HEAD = "| col A | col B |\n| --- | --- |\n";
+
+test("表格内 wikilink 首次插入 size：竖线转义", async () => {
+    const { job } = makeJob({ detectFn: () => 8 }); // scale=2 ⇒ 400×2=800
+    const table = `${TABLE_HEAD}| text | ![[a.png]] |`;
+    const res = await rewriteWithSections(
+        job, table, [["![[a.png]]", "a.png"]], sectionsWithTable(table, table),
+    );
+    assert.equal(res.resized, 1);
+    assert.equal(res.newContent, `${TABLE_HEAD}| text | ![[a.png\\|800]] |`);
+});
+
+test("表格内 standard image 有 alt：竖线转义", async () => {
+    const { job } = makeJob({ detectFn: () => 16 });
+    const table = `${TABLE_HEAD}| text | ![alt](a.png) |`;
+    const res = await rewriteWithSections(
+        job, table, [["![alt](a.png)", "a.png"]], sectionsWithTable(table, table),
+    );
+    assert.equal(res.newContent, `${TABLE_HEAD}| text | ![alt\\|400](a.png) |`);
+});
+
+test("表格内 standard image 空 alt：size 直接填进 alt，不产生竖线", async () => {
+    const { job } = makeJob({ detectFn: () => 16 });
+    const table = `${TABLE_HEAD}| text | ![](a.png) |`;
+    const res = await rewriteWithSections(
+        job, table, [["![](a.png)", "a.png"]], sectionsWithTable(table, table),
+    );
+    assert.equal(res.newContent, `${TABLE_HEAD}| text | ![400](a.png) |`);
+});
+
+test("表格内已转义的 size 被替换：反斜杠不累积（二次运行幂等）", async () => {
+    const { job } = makeJob({ detectFn: () => 16 });
+    const table = `${TABLE_HEAD}| text | ![[a.png\\|123]] |`;
+    const res = await rewriteWithSections(
+        job, table, [["![[a.png\\|123]]", "a.png"]], sectionsWithTable(table, table),
+    );
+    assert.equal(res.newContent, `${TABLE_HEAD}| text | ![[a.png\\|400]] |`);
+});
+
+test("表格内 caption + 已转义 size：caption 保留，两个分隔符都转义", async () => {
+    const { job } = makeJob({ detectFn: () => 16 });
+    const table = `${TABLE_HEAD}| text | ![[a.png\\|caption\\|123]] |`;
+    const res = await rewriteWithSections(
+        job, table, [["![[a.png\\|caption\\|123]]", "a.png"]], sectionsWithTable(table, table),
+    );
+    assert.equal(res.newContent, `${TABLE_HEAD}| text | ![[a.png\\|caption\\|400]] |`);
+});
+
+test("表格内用户手写的裸 size 被顺带修正成转义形式", async () => {
+    const { job } = makeJob({ detectFn: () => 16 });
+    const table = `${TABLE_HEAD}| text | ![[a.png|123]] |`;
+    const res = await rewriteWithSections(
+        job, table, [["![[a.png|123]]", "a.png"]], sectionsWithTable(table, table),
+    );
+    assert.equal(res.newContent, `${TABLE_HEAD}| text | ![[a.png\\|400]] |`);
+});
+
+test("同一篇里表格内转义、表格外保持裸竖线", async () => {
+    const { job } = makeJob({ detectFn: () => 16 });
+    const table = `${TABLE_HEAD}| text | ![[a.png]] |`;
+    const tail = "正文 ![[b.png]] 结束";
+    const src = `${table}\n\n${tail}`;
+    const res = await rewriteWithSections(job, src, [
+        ["![[a.png]]", "a.png"],
+        ["![[b.png]]", "b.png"],
+    ], sectionsWithTable(src, table, [tail]));
+    assert.equal(res.resized, 2);
+    assert.equal(
+        res.newContent,
+        `${TABLE_HEAD}| text | ![[a.png\\|400]] |\n\n正文 ![[b.png|400]] 结束`,
+    );
+});
+
+test("sections 缺失时退回裸竖线（不猜测表格，保持既有行为）", async () => {
+    const { job } = makeJob({ detectFn: () => 16 });
+    const table = `${TABLE_HEAD}| text | ![[a.png]] |`;
+    const res = await rewriteWithCache(job, table, [["![[a.png]]", "a.png"]]);
+    assert.equal(res.newContent, `${TABLE_HEAD}| text | ![[a.png|400]] |`);
 });
 
 // ---------------------------------------------------------------------------

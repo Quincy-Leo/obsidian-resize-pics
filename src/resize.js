@@ -21,6 +21,25 @@ const CONTENT_ROOT_SELECTORS = [".markdown-preview-view", ".cm-content"];
 //   matches: "386", "386x200", "  42  "     mismatches: "abc", "3.5", "386x", ""
 const SIZE_SEGMENT_RE = /^\s*\d+(?:x\d+)?\s*$/;
 
+// Segment separator inside `![[path|…]]` and `![alt|…](url)`. Matches the
+// escaped form too, because inside a Markdown table cell the pipe MUST be
+// written `\|` (a raw one would close the cell), so a note that already carries
+// a table-safe size arrives here as `a.png\|300`. Splitting on both forms
+// normalises segments to clean text, which is what lets us re-emit whichever
+// separator the current context needs. Without that normalisation a second run
+// over a table would stack backslashes: `a.png\` + `\|` → `a.png\\|`.
+//   matches: "a|b", "a\|b"     mismatches: "a\\b"
+const SEGMENT_SPLIT_RE = /\\?\|/;
+
+/**
+ * The separator to write back. Table cells need the pipe escaped so the table
+ * parser doesn't read it as a column break; everywhere else the bare pipe is
+ * what Obsidian expects.
+ */
+function segmentSeparator(inTable) {
+    return inTable ? "\\|" : "|";
+}
+
 // Symmetric sanity clamp on bodyFontPx / imageTextHeightPx: refuse to
 // resize when the ratio is more than this many × away from 1 in either
 // direction (i.e. accept scale ∈ [1/MAX_SCALE_RATIO, MAX_SCALE_RATIO]).
@@ -72,22 +91,30 @@ function applySizeToSegments(segments, newWidth) {
     return segments.concat([String(newWidth)]);
 }
 
-/** Rewrite `![[path|...]]` — path preserved, size segment set/updated. */
-function rewriteWikilinkInner(inner, newWidth) {
-    const parts = inner.split("|");
+/**
+ * Rewrite `![[path|...]]` — path preserved, size segment set/updated.
+ * @param {boolean} [inTable] Emit `\|` instead of `|` (see segmentSeparator).
+ */
+function rewriteWikilinkInner(inner, newWidth, inTable) {
+    const separator = segmentSeparator(inTable);
+    const parts = inner.split(SEGMENT_SPLIT_RE);
     const linkpath = parts[0];
     const suffix = applySizeToSegments(parts.slice(1), newWidth);
-    return suffix.length > 0 ? `${linkpath}|${suffix.join("|")}` : linkpath;
+    return suffix.length > 0
+        ? `${linkpath}${separator}${suffix.join(separator)}`
+        : linkpath;
 }
 
 /**
  * Rewrite the alt portion of `![alt](url)`. Empty alt is replaced with the
  * size; otherwise the size is applied to the pipe-separated segments in alt.
+ * The empty-alt case emits no separator at all, so it is already table-safe.
+ * @param {boolean} [inTable] Emit `\|` instead of `|` (see segmentSeparator).
  */
-function rewriteStandardAlt(alt, newWidth) {
+function rewriteStandardAlt(alt, newWidth, inTable) {
     if (alt === "") return String(newWidth);
-    const segments = applySizeToSegments(alt.split("|"), newWidth);
-    return segments.join("|");
+    const segments = applySizeToSegments(alt.split(SEGMENT_SPLIT_RE), newWidth);
+    return segments.join(segmentSeparator(inTable));
 }
 
 /**
@@ -373,8 +400,9 @@ class ResizeImagesJob {
             const newWidth = Math.max(1, Math.round(dims.naturalWidth * scale));
 
             const replacement = edit.kind === "wikilink"
-                ? `![[${rewriteWikilinkInner(edit.inner, newWidth)}]]`
-                : `${edit.original.slice(0, 2)}${rewriteStandardAlt(edit.alt, newWidth)}`
+                ? `![[${rewriteWikilinkInner(edit.inner, newWidth, edit.inTable)}]]`
+                : `${edit.original.slice(0, 2)}`
+                    + `${rewriteStandardAlt(edit.alt, newWidth, edit.inTable)}`
                     + edit.original.slice(edit.altEnd);
 
             result = result.substring(0, edit.start) + replacement + result.substring(edit.end);
