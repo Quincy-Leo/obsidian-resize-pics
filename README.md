@@ -29,7 +29,13 @@ OCR is powered by Tesseract.js; before first use, cache the language models and 
 
 ## 🚀 Installation
 
-**Manual install (only supported method for now)**
+### From the community plugin store (recommended)
+
+1. **Settings → Community plugins**; if Restricted mode is on, turn it off
+2. Click **Browse**, search for `resize-pics`, then **Install**
+3. Enable it under **Installed plugins**
+
+### Manual install
 
 ```
 <Your Vault>/.obsidian/plugins/resize-pics/
@@ -40,7 +46,11 @@ OCR is powered by Tesseract.js; before first use, cache the language models and 
 1. Create the directory `.obsidian/plugins/resize-pics/` inside your vault
 2. Run `npm install` in the repo root
 3. Edit `TARGET_DIR` at the top of `build.sh` to point at the directory above, then run `./build.sh` — it bundles via esbuild and copies `main.js` / `manifest.json` for you
-4. Enable the plugin in Obsidian, then open its settings page and click **Download dependencies** to pull the ~12 MB Tesseract runtime
+4. Enable the plugin in Obsidian
+
+### First run — either method
+
+Open the plugin's settings page and click **Download dependencies** to pull the ~12 MB Tesseract runtime. OCR stays unavailable until all 4 assets report `ready`; the runtime is deliberately not bundled with the plugin.
 
 ---
 

@@ -29,7 +29,13 @@
 
 ## 🚀 安装
 
-**手动安装（当前仅此方式）**
+### 从社区插件市场安装（推荐）
+
+1. **设置 → 第三方插件**；若"受限模式"处于开启状态，先关掉它
+2. 点击**浏览**，搜索 `resize-pics`，然后点**安装**
+3. 在**已安装插件**列表里启用它
+
+### 手动安装
 
 ```
 <Your Vault>/.obsidian/plugins/resize-pics/
@@ -40,7 +46,11 @@
 1. 在你的 Vault 下创建 `.obsidian/plugins/resize-pics/` 目录
 2. 在仓库根目录执行 `npm install`
 3. 编辑 `build.sh` 里的 `TARGET_DIR` 指向上述目录，然后运行 `./build.sh` —— 会调用 esbuild 打包并把 `main.js` / `manifest.json` 拷贝过去
-4. 在 Obsidian 中启用插件，然后打开设置页点击 **下载依赖项** 拉取约 12 MB 的 Tesseract 运行时
+4. 在 Obsidian 中启用插件
+
+### 首次使用 —— 两种方式都需要
+
+打开插件设置页，点击**下载依赖项**拉取约 12 MB 的 Tesseract 运行时。4 个资源全部显示"已就绪"之前 OCR 不可用；这套运行时是有意不打包进插件的。
 
 ---
 
